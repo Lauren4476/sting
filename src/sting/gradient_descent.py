@@ -8,6 +8,7 @@ Last updated: 19-06-2026
 '''
 
 import os
+from collections import namedtuple
 
 import jax.numpy as jnp
 from jax import value_and_grad, lax
@@ -957,7 +958,110 @@ def chi2_loss(
 
 
 
-def fit_streamline(initial_opt_params, fixed_params, data, uncertainties, distance_pc,
+InitialGuessResult = namedtuple('InitialGuessResult', [
+    'model_params',
+    'ra_model',
+    'dec_model',
+    'v_model',
+    'ra_model_interp',
+    'dec_model_interp',
+    'v_model_interp',
+    'valid',
+    'chi2_total',
+    'chi2_components',
+])
+ 
+ 
+def evaluate_initial_guess(
+    initial_opt_params,
+    fixed_params,
+    data,
+    uncertainties,
+    distance_pc,
+    n_elements=10,
+    loss_method=0,
+):
+    """
+    Run the forward model and compute chi2 loss for the initial parameter guess.
+ 
+    Parameters
+    ----------
+    initial_opt_params : dict
+        Initial guesses for the parameters to optimise.
+    fixed_params : dict
+        Fixed (non-optimised) parameters. Together with initial_opt_params
+        this must provide a full, non-overlapping partition of
+        STREAMLINE_MODEL_PARAM_KEYS.
+    data : tuple of arrays (ra_data, dec_data, v_data)
+        Observed RA offset (arcsec), Dec offset (arcsec), velocity (km/s).
+    uncertainties : tuple of arrays (ra_sigma, dec_sigma, v_sigma)
+        Uncertainties on the data.
+    distance_pc : float
+        Distance to source in parsecs.
+    n_elements : int
+        Number of distance-metric partitions, i.e. the number of 1D data
+        points. Must match the value used when reducing the cube.
+    loss_method : int
+        Loss definition to use. Options:
+        - 0: radecvel — RA, Dec, and velocity residuals.
+        - 1: rthetavel — radial distance, polar angle, and velocity residuals.
+ 
+    Returns
+    -------
+    InitialGuessResult
+        Named tuple with entries:
+        - model_params       : merged dict of all model parameters (float64)
+        - ra_model           : full model RA offsets (arcsec)
+        - dec_model          : full model Dec offsets (arcsec)
+        - v_model            : full model velocities (km/s)
+        - ra_model_interp    : model RA interpolated at data positions
+        - dec_model_interp   : model Dec interpolated at data positions
+        - v_model_interp     : model velocity interpolated at data positions
+        - valid              : boolean mask of retained data points
+        - chi2_total         : total chi2 loss (float)
+        - chi2_components    : dict of per-component chi2 values and chi2_total
+    """
+    loss_method = check_loss_method(loss_method)
+ 
+    model_params, _, _ = prepare_model_params(initial_opt_params, fixed_params)
+ 
+    ra_model, dec_model, v_model, valid_mask_model, err = forward_model(
+        model_params, distance_pc
+    )
+    err.throw()
+ 
+    ra_model_interp, dec_model_interp, v_model_interp, valid, _, _, _ = (
+        checked_match_model_to_data_curve(
+            ra_model, dec_model, v_model, valid_mask_model,
+            jnp.asarray(data[0], dtype=jnp.float64),
+            jnp.asarray(data[1], dtype=jnp.float64),
+        )
+    )
+ 
+    prepared_data = extract_streamline.prepare_data(data, uncertainties, n_elements=n_elements)
+    chi2_total, loss_trace, _ = chi2_loss(
+        model_params, distance_pc, prepared_data, loss_method=loss_method
+    )
+    chi2_components = loss_trace['chi2_components']
+ 
+    n_valid = int(jnp.sum(valid))
+    n_total = len(valid)
+ 
+    return InitialGuessResult(
+        model_params=model_params,
+        ra_model=ra_model,
+        dec_model=dec_model,
+        v_model=v_model,
+        ra_model_interp=ra_model_interp,
+        dec_model_interp=dec_model_interp,
+        v_model_interp=v_model_interp,
+        valid=valid,
+        chi2_total=float(chi2_total),
+        chi2_components={k: float(v) for k, v in chi2_components.items()},
+    )
+
+
+def fit_streamline(initial_opt_params, fixed_params, streamer, distance_pc,
                    learning_rate=0.001, param_bounds=None, n_epochs=1000,
                    beta1=0.9, beta2=0.999,
                    info_every=100, loss_threshold=None, loss_threshold_epochs=1,
@@ -965,7 +1069,6 @@ def fit_streamline(initial_opt_params, fixed_params, data, uncertainties, distan
                    early_stopping_patience=50,
                    save_folder='sting_results',
                    loss_method=0, # 0: radecvel, 1: rthetavel
-                   pc_coords=None,
                    v_lsr=None,
                    show_plots=False
                    ):
@@ -986,6 +1089,8 @@ def fit_streamline(initial_opt_params, fixed_params, data, uncertainties, distan
         Fixed (non-optimised) parameters using the same key space.
         Together with initial_opt_params, this must provide a full,
         non-overlapping partition of STREAMLINE_MODEL_PARAM_KEYS.
+    streamer: NamedTuple with fields:
+        pc_coords, ra_data, dec_data, v_data, ra_sigma, dec_sigma, v_sigma, data, uncertainties 
     data : tuple of arrays (ra_data, dec_data, v_data)
         Observed RA offset (arcsec), Dec offset (arcsec), velocity (km/s)
     uncertainties : tuple of arrays (ra_sigma, dec_sigma, v_sigma)
@@ -1018,9 +1123,6 @@ def fit_streamline(initial_opt_params, fixed_params, data, uncertainties, distan
         - 0: radecvel: optimise RA, Dec, and velocity residuals.
         - 1: rthetavel: optimise radial distance, polar angle, and velocity residuals.
         Both options use the same model-data matching and overlap penalty.
-    pc_coords : array-like or None
-        Point cloud coordinates (3, N): [ra_offsets, dec_offsets, velocities].
-        When provided, used as a KDE background in the best-fit velocity-radius plot.
     v_lsr : float or None
         Systemic velocity (km/s). When provided, drawn as a reference line on the best-fit
         velocity-radius plot
@@ -1076,8 +1178,8 @@ def fit_streamline(initial_opt_params, fixed_params, data, uncertainties, distan
 
 
     opt_param_keys = list(opt_params.keys())
-    data = make_data_tuple_float64(data)
-    uncertainties = make_data_tuple_float64(uncertainties)
+    data = make_data_tuple_float64(streamer.data)
+    uncertainties = make_data_tuple_float64(streamer.uncertainties)
     distance_pc = to_float64(distance_pc)
     learning_rate = to_float64(learning_rate)
     if not bool(jnp.isfinite(learning_rate)):
@@ -1450,13 +1552,11 @@ def fit_streamline(initial_opt_params, fixed_params, data, uncertainties, distan
             ordered_best_opt_params,
             opt_param_keys,
             fixed_params,
-            data,
-            uncertainties,
+            streamer,
             distance_pc,
             loss_history,
             param_errors=param_errors,
             cov_matrix=cov_matrix,
-            pc_coords=pc_coords,
             v_lsr=v_lsr,
             save_folder=save_folder,
             show_plots=show_plots,

@@ -23,6 +23,14 @@ PreparedData = namedtuple('PreparedData', [
     'r_proj_data', 'theta_proj_data',
 ])
 
+StreamerData = namedtuple('StreamerData', [
+    'pc_coords',
+    'ra_data', 'dec_data', 'v_data',
+    'ra_sigma', 'dec_sigma', 'v_sigma',
+    'data', 'uncertainties',
+])
+
+
 
 #@jax.jit
 def wrap_to_pi(angle):
@@ -95,10 +103,17 @@ def reduce_to_1D(streamer_cube, yso_centre, n_elements=10):
 
     Returns
     -------
-    pc_means : array of shape (3, n_elements), the weighted mean coordinates of each bin
-    index 0 = RA offsets (arcsec)
-    index 1 = Dec offsets (arcsec)
-    index 2 = velocity (km/s)
+    StreamerData
+        Named tuple with fields:
+        - pc_coords    : full point cloud array, shape (3, N)
+        - ra_data      : RA offsets of bin means (arcsec), shape (n_elements,)
+        - dec_data     : Dec offsets of bin means (arcsec), shape (n_elements,)
+        - v_data       : velocities of bin means (km/s), shape (n_elements,)
+        - ra_sigma     : RA standard deviations per bin (arcsec), shape (n_elements,)
+        - dec_sigma    : Dec standard deviations per bin (arcsec), shape (n_elements,)
+        - v_sigma      : velocity standard deviations per bin (km/s), shape (n_elements,)
+        - data         : (ra_data, dec_data, v_data) tuple
+        - uncertainties: (ra_sigma, dec_sigma, v_sigma) tuple
     '''
     print('Starting reduction')
     nz, ny, nx = streamer_cube.shape
@@ -121,7 +136,6 @@ def reduce_to_1D(streamer_cube, yso_centre, n_elements=10):
     spectral_unit = u.Unit(streamer_cube.header.get('CUNIT3', streamer_cube.spectral_axis.unit))
     spectral_axis = streamer_cube.spectral_axis.to(spectral_unit)
     v_coords = spectral_axis.to(u.km / u.s).value
-    print('Created coordinate arrays')
 
     # get data and mask
     pcloud = np.array(streamer_cube)
@@ -132,7 +146,6 @@ def reduce_to_1D(streamer_cube, yso_centre, n_elements=10):
     pc_z = pc_indices[0][rms_mask]
     pc_y = pc_indices[1][rms_mask]
     pc_x = pc_indices[2][rms_mask]
-    print('Got point cloud with', len(flux), 'points')
 
     # extract coordinates of valid points using the arrays above
     pc_ra = ra_coords[pc_y, pc_x]
@@ -144,7 +157,6 @@ def reduce_to_1D(streamer_cube, yso_centre, n_elements=10):
     distance_metric, _ = get_distance_metric(pc_coords[0], pc_coords[1], n_elements=n_elements)
     b_per = np.linspace(0, 100, n_elements+1) # percentiles to bin the pc into
     partitions = np.array([np.percentile(distance_metric, per) for per in b_per])
-    print("Partition boundaries for projected distance metric:", np.round(partitions, 3))
 
     # flux-weighted means and stds in each bin
     pc_means = np.zeros((3, n_elements))
@@ -161,8 +173,17 @@ def reduce_to_1D(streamer_cube, yso_centre, n_elements=10):
     # flip arrays so that they go from large to small distance (towards star)
     pc_means = pc_means[:, ::-1]
     pc_stds = pc_stds[:, ::-1]
+
+    ra_data, dec_data, v_data = pc_means
+    ra_sigma, dec_sigma, v_sigma = pc_stds
     
-    return pc_coords, pc_means, pc_stds
+    return StreamerData(
+        pc_coords=pc_coords,
+        ra_data=ra_data, dec_data=dec_data, v_data=v_data,
+        ra_sigma=ra_sigma, dec_sigma=dec_sigma, v_sigma=v_sigma,
+        data=(ra_data, dec_data, v_data),
+        uncertainties=(ra_sigma, dec_sigma, v_sigma),
+    )
 
 
 #@jax.jit
