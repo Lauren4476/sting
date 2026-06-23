@@ -1,0 +1,9 @@
+# when the package is installed, the list of dependencies to install actually comes from pyproject.toml,
+# but we include the list here too for clarity
+numpy
+astropy
+jax
+optax
+matplotlib
+pandas
+spectral_cube

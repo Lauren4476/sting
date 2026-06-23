@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools >= 77.0.3"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sting"
+version = "0.0.1"
+authors = [
+    { name="Lauren Mason", email="lmason@mpe.mpg.de" },
+]
+maintainers = [
+    { name="Lauren Mason", email="lmason@mpe.mpg.de" },
+]
+description = "STreamer INfall with Gradients"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+    "numpy",
+    "astropy",
+    "jax",
+    "optax",
+    "matplotlib",
+    "pandas",
+    "spectral_cube"
+]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Operating System :: OS Independent",
+]
+license = "MIT"
+license-files = ["LICEN[CS]E*"]
+
+[project.urls]
+Homepage = "https://github.com/Lauren4476/STING"
+Issues = "https://github.com/Lauren4476/STING/issues"
