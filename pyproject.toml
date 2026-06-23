@@ -1,19 +1,8 @@
 [build-system]
-requires = ["setuptools >= 77.0.3"]
+requires = ["setuptools >= 77.0.3", "setuptools-scm >= 8"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "sting_astro"
-version = "0.0.1"
-authors = [
-    { name="Lauren Mason", email="lmason@mpe.mpg.de" },
-]
-maintainers = [
-    { name="Lauren Mason", email="lmason@mpe.mpg.de" },
-]
-description = "STreamer INfall with Gradients"
-readme = "README.md"
-requires-python = ">=3.9"
 dependencies = [
     "numpy",
     "astropy",
@@ -23,12 +12,34 @@ dependencies = [
     "pandas",
     "spectral_cube"
 ]
+name = "sting_astro"
+requires-python = ">=3.12"
+authors = [{ name="Lauren Mason", email="lmason@mpe.mpg.de" }]
+maintainers = [{ name="Lauren Mason", email="lmason@mpe.mpg.de" }]
+description = "STreamer INfall with Gradients"
+readme = "README.md"
+license = { text = "MIT Licence" }
+dynamic = ["version"]
 classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Intended Audience :: Science/Research",
+    "Topic :: Scientific/Engineering :: Astronomy",
+    "License :: OSI Approved :: MIT License",
+    "Natural Language :: English",
+    "Topic :: Software Development :: Libraries :: Python Modules",
     "Programming Language :: Python :: 3",
     "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
 ]
-license = "MIT"
-license-files = ["LICEN[CS]E*"]
+
+[tool.setuptools_scm]
+version_file = "src/sting/_version.py"
+
+[tool.pytest.ini_options]
+pythonpath = "src/"
+addopts = ["--ignore=src/sting/_version.py"]
 
 [project.urls]
 Homepage = "https://github.com/Lauren4476/STING"
