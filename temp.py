@@ -1,10 +1,13 @@
 """
-Tests for outputs.py
+Initial tests for outputs.py
 
 Tests cover pure/logic functions that can be exercised without the full JAX
 forward model or filesystem side-effects, plus lightweight smoke tests for the
 I/O and plotting helpers (using tmp_path and matplotlib's non-interactive
 Agg backend).
+
+Run with:
+    pytest test_outputs.py -v
 """
 
 import json
@@ -77,10 +80,6 @@ plot_param_uncertainties = outputs_module.plot_param_uncertainties
 plot_param_correlations = outputs_module.plot_param_correlations
 sample_parameter_sets_from_covariance = outputs_module.sample_parameter_sets_from_covariance
 load_optimisation_log = outputs_module.load_optimisation_log
-plot_morphology = outputs_module.plot_morphology
-plot_ra_vel = outputs_module.plot_ra_vel
-plot_dec_vel = outputs_module.plot_dec_vel
-plot_vel_radius = outputs_module.plot_vel_radius
 
 
 # ===========================================================================
@@ -95,25 +94,6 @@ def _make_log_csv(tmp_path, epochs, loss, extra_cols=None):
     df = pd.DataFrame(data)
     df.to_csv(tmp_path / "optimisation_log.csv", index=False)
     return df
-
-def _make_streamer(n=8):
-    """Return a minimal SimpleNamespace object that mimics the Streamer namedtuple in the real code."""
-    rng = np.random.default_rng(42)
-    # Generate some random RA, Dec, and velocity values for the streamer data 1D streamline
-    ra = rng.uniform(-5.0, 5.0, n)
-    dec = rng.uniform(-5.0, 5.0, n)
-    v = rng.uniform(-3.0, 3.0, n)
-    sig = np.full(n, 0.1)  # constant uncertainty for simplicity
-    # Generate some random point cloud coordinates that the streamer data came from
-    pc_coords=(
-        rng.uniform(-6.0, 6.0, 30),
-        rng.uniform(-6.0, 6.0, 30),
-        rng.uniform(-4.0, 4.0, 30)
-    )
-
-    import types
-    s = types.SimpleNamespace(ra_data=ra, dec_data=dec, v_data=v, ra_sigma=sig, dec_sigma=sig, v_sigma=sig, pc_coords=pc_coords, data=(ra, dec, v), uncertainties=(sig, sig, sig))
-    return s
 
 
 # ===========================================================================
@@ -231,6 +211,9 @@ class TestSaveBestFitParams:
         save_best_fit_params({"r0": 1.0}, {}, None, str(nested))
         assert (nested / "best_fit_params.json").exists()
 
+class TestSaveBestFitParamsAngleError:
+    """Angle parameters in param_errors must be converted to degrees in the JSON."""
+
     def test_angle_error_stored_in_degrees(self, tmp_path):
         save_best_fit_params(
             best_opt_params={"inc": math.pi / 6},   # 30 deg
@@ -253,6 +236,7 @@ class TestSaveBestFitParams:
         with open(tmp_path / "best_fit_params.json") as f:
             data = json.load(f)
         assert pytest.approx(data["optimised_parameters"]["r0"]["sigma"]) == 7.5
+
 
 
 # ===========================================================================
@@ -397,7 +381,6 @@ class TestPlotLossExtraPaths:
         plot_loss(list(np.logspace(0, -3, 20)), save_folder=str(tmp_path))
         assert (tmp_path / "loss_history.png").exists()
 
-
 # ===========================================================================
 # build_velocity_radius_kde
 # ===========================================================================
@@ -457,7 +440,7 @@ class TestBuildVelocityRadiusKde:
 
 
 # ===========================================================================
-# plot_param_uncertainties
+# plot_param_uncertainties (smoke)
 # ===========================================================================
 
 class TestPlotParamUncertainties:
@@ -471,7 +454,7 @@ class TestPlotParamUncertainties:
     def test_single_parameter(self, tmp_path):
         plot_param_uncertainties(["r0"], np.array([100.0]), np.array([5.0]), save_folder=str(tmp_path))
         assert (tmp_path / "parameter_uncertainties.png").exists()
-        
+
     def test_uncertainties_show_true(self):
         plot_param_uncertainties(
             ["r0", "mass"],
@@ -484,7 +467,7 @@ class TestPlotParamUncertainties:
 
 
 # ===========================================================================
-# plot_param_correlations 
+# plot_param_correlations (smoke + correctness)
 # ===========================================================================
 
 class TestPlotParamCorrelations:
@@ -514,7 +497,7 @@ class TestPlotParamCorrelations:
     def test_no_annotate_does_not_raise(self, tmp_path):
         cov = self._identity_cov(2)
         plot_param_correlations(["a", "b"], cov, annotate=False, save_folder=str(tmp_path))
-
+    
     def test_correlations_show_true(self):
         plot_param_correlations(
             ["r0", "mass"],
@@ -580,6 +563,68 @@ class TestSampleParameterSetsFromCovariance:
 
 
 # ===========================================================================
+# Bring in extra names not imported at module level in the original file
+# ===========================================================================
+
+plot_morphology = outputs_module.plot_morphology
+plot_ra_vel = outputs_module.plot_ra_vel
+plot_dec_vel = outputs_module.plot_dec_vel
+plot_vel_radius = outputs_module.plot_vel_radius
+
+
+# ===========================================================================
+# Shared test fixtures
+# ===========================================================================
+
+def _make_streamer(n=8):
+    """Return a SimpleNamespace that mimics the Streamer namedtuple."""
+    rng = np.random.default_rng(42)
+    ra   = rng.uniform(1.0, 5.0, n)
+    dec  = rng.uniform(1.0, 5.0, n)
+    v    = rng.uniform(-3.0, 3.0, n)
+    sig  = np.full(n, 0.1)
+
+    import types
+    s = types.SimpleNamespace(
+        ra_data=ra,
+        dec_data=dec,
+        v_data=v,
+        ra_sigma=sig,
+        dec_sigma=sig,
+        v_sigma=sig,
+        pc_coords=(
+            rng.uniform(0, 8, 30),   # ra cloud
+            rng.uniform(0, 8, 30),   # dec cloud
+            rng.uniform(-5, 5, 30),  # vel cloud
+        ),
+        data=(ra, dec, v),
+        uncertainties=(sig, sig, sig),
+    )
+    return s
+
+
+# ===========================================================================
+# save_best_fit_params – angle error branch (line ~212)
+# ===========================================================================
+
+
+# ===========================================================================
+# plot_loss – show=True / save_folder=None paths
+# ===========================================================================
+
+class TestPlotLossExtraPaths:
+    def test_no_save_folder_does_not_write_file(self, tmp_path):
+        """With save_folder=None nothing should be written to disk."""
+        plot_loss([1.0, 0.5, 0.1], save_folder=None, show=False)
+        assert list(tmp_path.iterdir()) == []
+
+    def test_descending_loss(self, tmp_path):
+        """Monotonically decreasing loss should still produce a valid PNG."""
+        plot_loss(list(np.logspace(0, -3, 20)), save_folder=str(tmp_path))
+        assert (tmp_path / "loss_history.png").exists()
+
+
+# ===========================================================================
 # _ensure_clean_dir – subdirectory preservation
 # ===========================================================================
 
@@ -595,6 +640,7 @@ class TestEnsureCleanDirSubdirs:
         # file is gone, subdir survives
         assert not (d / "file.txt").exists()
         assert child_dir.exists()
+
 
 # ===========================================================================
 # build_velocity_radius_kde – sigma_levels parameter

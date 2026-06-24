@@ -478,6 +478,11 @@ def plot_morphology(
     
     For a single plot, pass pc_corords and metric_boundaries directly. For per-epoch plotting use plot_morphology_by_epoch, 
     which will call this function and pass pre-rendered background images for speed.'''
+    ra_data = None
+    dec_data = None
+    ra_sigma = None
+    dec_sigma = None
+    pc_coords = None
     if streamer is not None:
         ra_data = streamer.ra_data
         dec_data = streamer.dec_data
@@ -571,14 +576,20 @@ def plot_morphology(
     if xlim is not None:
         ax.set_xlim(xlim)
     else:
-        all_ra = np.concatenate([*[e for e in [ra_model, ra_data, pc_coords[0], np.array([star_ra])] if e is not None]])
+        if pc_coords is not None:
+            all_ra = np.concatenate([*[e for e in [ra_model, ra_data, pc_coords[0], np.array([star_ra])] if e is not None]])
+        else:
+            all_ra = np.concatenate([*[e for e in [ra_model, ra_data, np.array([star_ra])] if e is not None]])
         pad_ra = 0.05 * (all_ra.max() - all_ra.min())
         ra_lim = (all_ra.min() - pad_ra, all_ra.max() + pad_ra)
         ax.set_xlim(ra_lim)
     if ylim is not None:
         ax.set_ylim(ylim)
     else:
-        all_dec = np.concatenate([*[e for e in [dec_model, dec_data, pc_coords[1], np.array([star_dec])] if e is not None]])
+        if pc_coords is not None:
+            all_dec = np.concatenate([*[e for e in [dec_model, dec_data, pc_coords[1], np.array([star_dec])] if e is not None]])
+        else:
+            all_dec = np.concatenate([*[e for e in [dec_model, dec_data, np.array([star_dec])] if e is not None]])
         pad_dec = 0.05 * (all_dec.max() - all_dec.min())
         dec_lim = (all_dec.min() - pad_dec, all_dec.max() + pad_dec)
         ax.set_ylim(dec_lim)
@@ -696,6 +707,11 @@ def plot_ra_vel(
     save_name='streamline_ra_vel',
     show=False,
 ):
+    ra_data = None
+    v_data = None
+    ra_sigma = None
+    v_sigma = None
+    pc_coords = None
     if streamer is not None:
         ra_data = streamer.ra_data
         v_data = streamer.v_data
@@ -859,6 +875,11 @@ def plot_dec_vel(
     save_name='streamline_dec_vel',
     show=False,
 ):
+    dec_data = None
+    v_data = None
+    dec_sigma = None
+    v_sigma = None
+    pc_coords = None
     if streamer is not None:
         dec_data = streamer.dec_data
         v_data = streamer.v_data
