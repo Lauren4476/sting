@@ -117,7 +117,7 @@ def build_stream_quantities(mass, r0, theta0, mu, v_r0):
     return StreamState(rc=rc, mu=mu, nu=nu, epsilon=epsilon, ecc=ecc, vk0=vk0)
 
 @jax.jit
-def safe_arccos(x, eps=1e-8):
+def safe_arccos(x, eps=1e-10):
     '''
     Safe arccos function with clipping to valid range [-1, 1],
     with a small margin to avoid numerical issues in gradients near the boundaries
@@ -177,15 +177,16 @@ def get_dphi(theta, theta0=jnp.radians(30)):
     :param theta0: radians
     :return: difference in Phi angle, radians
     '''
+    small_eps = to_float64(1e-12) # need a very small eps since tan(theta) can be very small for theta near 0 or pi
     tan_theta_safe = jnp.where(
-        jnp.abs(jnp.tan(theta)) > eps,
+        jnp.abs(jnp.tan(theta)) > small_eps,
         jnp.tan(theta),
-        jnp.sign(jnp.tan(theta)) * to_float64(eps),
+        jnp.sign(jnp.tan(theta)) * small_eps,
     )
     # handle exact zero case
-    tan_theta_safe = jnp.where(tan_theta_safe == 0.0, to_float64(eps), tan_theta_safe)
+    tan_theta_safe = jnp.where(tan_theta_safe == 0.0, small_eps, tan_theta_safe)
     arg = jnp.tan(theta0) / tan_theta_safe
-    return safe_arccos(arg)
+    return safe_arccos(arg, eps=small_eps)
 
 
 
