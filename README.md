@@ -18,7 +18,7 @@ With STING you can:
 
 1. **Extract a 1D streamline from a spectral cube.** Given a PPV cube containing candidate streamer emission, and the coordinates of its protostar, STING reduces the PPV cube to a set of `npoints` representative (RA offset, Dec offset, velocity) points with corresponding uncertainties
 2. **Model a streamline.** The streamline model used by STING is taken from [Mendoza et al. (2009)](https://doi.org/10.1111/j.1365-2966.2008.14210.x) — a ballistic model of rotating infall, dominated by the gravitational force of a sink mass at the star position.
-3. **Quickly fit the model to your data.** Streamline parameters are optimised with the Adam optimiser to minimise a chi-squared loss between the model and the observed streamline. Current parameters supported for optimisation: `r0`, `theta0`, `phi0`, `v_r0`, `omega` / `rc`.
+3. **Quickly fit the model to your data.** Streamline parameters are optimised with the Adam optimiser to minimise a chi-squared loss between the model and the observed streamline. Current parameters supported for optimisation: `r0`, `theta0`, `phi0`, `v_r0`, `omega` / `rc`, `mass`, `inc`, `pa`. You can optimise any combination of these.
 4. **Quantify uncertainties.** Parameter uncertainties are estimated from the Hessian of the loss at the best-fit point, and propagated into the model (e.g. as "streamline spaghetti" plots).
 5. **Visualise the result.** Pre-built plotting functions include: morphology, velocity vs. projected radius on sky plane, loss curves, parameter correlation and uncertainty sampling, and per-epoch animations of the fit converging.
 
@@ -109,12 +109,12 @@ initial_opt_params = {
     'phi0': 100.0 * u.deg,
     'omega': 5e-13 * (1 / u.s),
     'v_r0': 0.1 * u.km / u.s,
+    'mass': 4.0 * u.Msun,
+    'inc': -45 * u.deg,
+    'pa': 194 * u.deg
 }
 # parameters you want to keep fixed
 fixed_params = {
-    'inc': -45.0 * u.deg,
-    'pa': 194.0 * u.deg,
-    'mass': 4.0 * u.Msun,
     'rmin': 50.0 * u.au,
     'deltar': 30.0 * u.au,
     'v_lsr': v_lsr * u.km / u.s,
@@ -123,19 +123,31 @@ model_params, initial_opt_params, fixed_params = gradient_descent.prepare_model_
     initial_opt_params, fixed_params
 )
 
-# --- 3. Set bounds for 'r0' if it is in initial_opt_params ---
+# --- 3. Set bounds for 'r0', 'mass', 'inc', 'pa' if any of these are in initial_opt_params ---
 param_bounds = {
     'r0': (200.0, 10000.0) * u.au,
+    'mass': (3.0, 5.0) * u.Msun,
+    'inc': -45 * u.deg,
+    'pa': 194 * u.deg
 }
 
-# --- 4. Fit the streamline ---
+# --- 4. (optional) It is recommended to set priors for 'mass', 'inc', 'pa' if any of these are in initial_opt_params, to help break degeneracy ---
+# format 'parameter': (mean, sigma) * u.Unit
+priors = {
+    'mass': (4.0, 1.0) * u.Msun,
+    'inc': (-45, 10) * u.deg,
+    'pa': (194, 10) * u.deg
+}
+
+# --- 5. Fit the streamline ---
 best_opt_params, loss_history, param_errors = gradient_descent.fit_streamline(
     initial_opt_params,
     fixed_params,
     streamer,
     distance,
     param_bounds=param_bounds,
-    n_epochs=500,
+    priors=priors
+    n_epochs=1000,
     v_lsr=v_lsr,
     save_folder="sting_results",
 )
@@ -149,7 +161,21 @@ STING is intended for fitting kinematic streamer models to interferometric molec
 
 - High spectral and spatial resolution observations (~0.1 km/s, ~300 au resolution or better)
 - Sources with a well-constrained distance and systemic velocity
+- Sources with some prior constraints on sink mass, inclination, and position axis.
 - Streamer candidates that have already been isolated from the rest of the cube by preprocessing.
+
+### Priors
+
+It is possible to run STING without specifying a `priors` argument. However, PPV observations only contain data in 3 dimensions (RA, Dec, LOS velocity), while the streamline model has 6 dimensions (3D position, 3D velocity). As a result, some parameter combinations are "coupled" and may be only weakly constrained by the observations.
+
+Common degeneracies:
+- sink mass, `mass`, and angular velocity, `omega` or centrifugal radius, `rc`
+- source inclination, `inc`, and streamline initial polar angle, `theta0`
+- source position angle, `pa`, and streamline starting azimuthal angle, `phi0`
+
+As a result, when both parameters in one of these pairs are allowed to vary optimisation may converge more slowly as the optimiser drifts along a nearly-flat direction, and **uncertainty estimates will become large**.
+
+STING supports Gaussian priors on any optimisable parameter, specified as (mean, sigma). These are included in the loss function as additional chi-squared penalty terms, penalising the optimiser for adjusting parameters further from the prior mean. Where independent constraints are available from previous work, **I recommend applying priors to `mass`, `inc`, and `pa`**. This helps constrain otherwise degenerate parameter combinations and reduces uncertainties.
 
 ### Streamer preprocessing
 

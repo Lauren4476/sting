@@ -38,6 +38,7 @@ import math
 import sys
 import types
 
+from jax.debug import log
 import jax.numpy as jnp
 import numpy as np
 import pytest
@@ -1122,6 +1123,57 @@ class TestComputePriorPenalty:
         result = self._call(params, (1.0,), (0.1,), ("mass",))
         assert result.dtype == jnp.float64
 
+# ==========================================================================
+# add_rc_omega_to_log
+# ==========================================================================
+
+class TestAddRcOmegaToLog:
+    """Unit tests for the rc/omega logging helper."""
+
+    def test_mu_in_opt_adds_rc_and_omega(self):
+        opt = {
+            "mu": 0.3,
+            "r0": 1000.0,
+            "mass": 1.0,
+        }
+        fixed = {}
+        row = {}
+
+        gd.add_rc_omega_to_log(row, opt, fixed, opt)
+
+        assert row["rc"] == pytest.approx(300.0)
+        assert "omega" in row
+        assert "mu" not in row
+
+    def test_mu_in_fixed_adds_rc_and_omega(self):
+        opt = {
+            "r0": 1000.0,
+            "mass": 1.0,
+        }
+        fixed = {
+            "mu": 0.3,
+        }
+        row = {}
+
+        gd.add_rc_omega_to_log(row, opt, fixed, {**opt, **fixed})
+
+        assert row["rc"] == pytest.approx(300.0)
+        assert "omega" in row
+        assert "mu" not in row
+
+    def test_no_mu_leaves_row_unchanged(self):
+        opt = {
+            "rc": 300.0,
+            "r0": 1000.0,
+            "mass": 1.0,
+        }
+        fixed = {}
+        row = {}
+
+        gd.add_rc_omega_to_log(row, opt, fixed, {**opt, **fixed})
+
+        assert row == {}
+
 
 # ===========================================================================
 # format_param
@@ -1259,7 +1311,7 @@ class TestBuildTraceRow:
         # build_trace_row uses .get(..., nan) so the key is still present
         assert "chi2_prior" in row
         assert math.isnan(row["chi2_prior"])
-        
+
 # ===========================================================================
 # trace_tree_to_python
 # ===========================================================================
@@ -1358,3 +1410,135 @@ class TestGradientL2Norm:
         grad = {"r0": jnp.array(5.0, dtype=jnp.float64)}
         result = float(gd.gradient_l2_norm(grad))
         assert pytest.approx(result, rel=1e-9) == 5.0
+
+
+# ========================================================================
+# forward_model
+# ========================================================================
+
+class TestForwardModel:
+    """Unit tests for forward_model."""
+
+    @staticmethod
+    def _base_params():
+        return {
+            "mass": 1.0,
+            "r0": 1000.0,
+            "theta0": 0.8,
+            "phi0": 0.0,
+            "v_r0": -0.1,
+            "inc": 0.5,
+            "pa": 0.2,
+            "deltar": 10.0,
+            "rmin": 0.0,
+            "v_lsr": 5.0,
+        }
+
+    def test_returns_arrays_and_mask(self):
+        params = self._base_params()
+        params["mu"] = 0.3
+
+        ra, dec, vel, valid, err = gd.forward_model(
+            params,
+            distance_pc=140.0,
+            npoints=200,
+        )
+
+        assert len(ra) == 200
+        assert len(dec) == 200
+        assert len(vel) == 200
+        assert len(valid) == 200
+
+    def test_accepts_mu_parameterisation(self):
+        params = self._base_params()
+        params["mu"] = 0.3
+
+        ra, dec, vel, valid, err = gd.forward_model(
+            params,
+            distance_pc=140.0,
+            npoints=100,
+        )
+
+        assert ra.shape == dec.shape == vel.shape == valid.shape
+
+    def test_accepts_rc_parameterisation(self):
+        params = self._base_params()
+        params["rc"] = 300.0
+
+        ra, dec, vel, valid, err = gd.forward_model(
+            params,
+            distance_pc=140.0,
+            npoints=100,
+        )
+
+        assert ra.shape == dec.shape == vel.shape == valid.shape
+
+    def test_accepts_omega_parameterisation(self):
+        params = self._base_params()
+        params["omega"] = _slg.omega_from_mu(
+            mu=0.3,
+            mass=params["mass"],
+            r0=params["r0"],
+        )
+
+        ra, dec, vel, valid, err = gd.forward_model(
+            params,
+            distance_pc=140.0,
+            npoints=100,
+        )
+
+        assert ra.shape == dec.shape == vel.shape == valid.shape
+
+    def test_rc_and_mu_parameterisations_agree(self):
+        mu_params = self._base_params()
+        mu_params["mu"] = 0.3
+
+        rc_params = self._base_params()
+        rc_params["rc"] = 300.0
+
+        ra_mu, dec_mu, vel_mu, _, _ = gd.forward_model(
+            mu_params, distance_pc=140.0, npoints=200
+        )
+
+        ra_rc, dec_rc, vel_rc, _, _ = gd.forward_model(
+            rc_params, distance_pc=140.0, npoints=200
+        )
+
+        np.testing.assert_allclose(ra_mu, ra_rc)
+        np.testing.assert_allclose(dec_mu, dec_rc)
+        np.testing.assert_allclose(vel_mu, vel_rc)
+
+    def test_valid_mask_is_binary(self):
+        params = self._base_params()
+        params["mu"] = 0.3
+        _, _, _, valid, _ = gd.forward_model(
+            params,
+            distance_pc=140.0,
+            npoints=200,
+        )
+
+        vals = np.unique(np.asarray(valid))
+        assert set(vals).issubset({0, 1})
+
+    def test_valid_mask_matches_output_length(self):
+        params = self._base_params()
+        params["mu"] = 0.3
+        ra, dec, vel, valid, _ = gd.forward_model(
+            params,
+            distance_pc=140.0,
+            npoints=200,
+        )
+
+        assert len(valid) == len(ra)
+        assert len(valid) == len(dec)
+        assert len(valid) == len(vel)
+
+    def test_requires_mu_rc_or_omega(self):
+        params = self._base_params()
+
+        with pytest.raises(ValueError):
+            gd.forward_model(
+                params,
+                distance_pc=140.0,
+                npoints=100,
+            )

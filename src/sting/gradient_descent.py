@@ -761,16 +761,6 @@ def forward_model(model_params, distance_pc, npoints=10000):
 
     distance_pc = to_float64(distance_pc)
 
-    # Protect near-zero v_r0 from creating singularities in physics calculations
-    # Allow negative v_r0, but replace exact-zero or tiny values with signed epsilon
-    # v_r0_protected = model_params['v_r0']
-    # threshold = to_float64(1e-6)
-    # v_r0_protected = jnp.where(
-    #     jnp.isclose(v_r0_protected, to_float64(0.0)),
-    #     - jnp.sign(v_r0_protected) * threshold,
-    #     v_r0_protected
-    #     )
-
     # Run the forward model - returns positions in au, velocities in km/s
     # valid_mask is a boolean array marking which points are valid in the returned arrays, 
     # which can be used for masking in the loss function
