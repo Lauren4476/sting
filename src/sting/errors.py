@@ -272,6 +272,7 @@ def estimate_covariance_at_best_fit(
     best_for_cov_mu, fixed_params_mu, param_bounds, inferred_rotation_key = gradient_descent.with_mu_substituted(best_for_cov, fixed_params, param_bounds)
     if rotation_key is None and inferred_rotation_key in ('rc', 'omega'):
         rotation_key = inferred_rotation_key
+    param_bounds = gradient_descent.auto_fill_angle_bounds(best_for_cov_mu, param_bounds)
     normalisation_spec = gradient_descent.build_normalisation_spec(best_for_cov_mu, param_bounds)
     param_errors, cov, cov_transformed_dict = estimate_parameter_errors(
         best_for_cov_mu,

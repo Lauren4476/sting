@@ -1625,12 +1625,12 @@ def sample_parameter_sets_from_covariance(best_params, covariance, opt_keys, par
         cov,
         size=n_samples,
     )
-    if param_bounds is not None:
-        param_bounds = gradient_descent.convert_and_strip_bound_units(param_bounds)
-        for j, key in enumerate(opt_keys):
-            if key in param_bounds:
-                low, high = param_bounds[key]
-                samples[:, j] = np.clip(samples[:, j], low, high)
+    param_bounds = gradient_descent.auto_fill_angle_bounds(set(opt_keys), param_bounds)
+    param_bounds = gradient_descent.convert_and_strip_bound_units(param_bounds)
+    for j, key in enumerate(opt_keys):
+        if key in param_bounds:
+            low, high = param_bounds[key]
+            samples[:, j] = np.clip(samples[:, j], low, high)
 
     return samples
 

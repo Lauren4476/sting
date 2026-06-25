@@ -72,6 +72,13 @@ CANONICAL_UNITS = {
 }
 
 ANGLE_KEYS = {'theta0', 'phi0', 'inc', 'pa'}
+
+# might later add inc, pa here too
+ANGLE_BOUNDS_RAD = {
+    'theta0': (0.0, jnp.pi),
+    'phi0': (0.0, 2 * jnp.pi),
+}
+
 DISPLAY_UNITS = {
         'r0':      'au',
         'v_r0':    'km/s',
@@ -109,7 +116,9 @@ def convert_and_strip_bound_units(bounds):
 
     Required as JAX optimiser works with unitless arrays.
     """
-
+    if bounds is None:
+        return {}
+    
     output = {}
 
     for key, val in bounds.items():
@@ -479,6 +488,22 @@ def with_mu_substituted(opt_params, fixed_params, param_bounds=None):
         fixed_params['mu'] = mu_value
     
     return opt_params, fixed_params, param_bounds, rotation_key
+
+def auto_fill_angle_bounds(opt_params, param_bounds):
+    """Automatically fill in bounds for theta0 and phi0, since their ranges are fixed by physics.
+    If the user supplied bounds for these parameters by mistake, print a notice and ignore them."""
+    if param_bounds is None:
+        param_bounds = {}
+    else:
+        param_bounds = dict(param_bounds)
+    for key, auto_bounds in ANGLE_BOUNDS_RAD.items():
+        if key not in opt_params:
+            continue
+        if key in param_bounds:
+            print(f"Notice: Ignoring supplied bounds for '{key}', since the bounds are fixed by physics. Using automatic bounds ({math.degrees(auto_bounds[0])} - {math.degrees(auto_bounds[1])} degrees).")
+        param_bounds[key] = auto_bounds
+
+    return param_bounds
 
 def format_param(key, value):
     """
@@ -1101,11 +1126,8 @@ def fit_streamline(initial_opt_params, fixed_params, streamer, distance_pc,
         Adam learning rate applied uniformly to all normalised parameters.
     param_bounds : dict or None
         Parameter bounds in physical/log parameter units.
-        optimisation is performed in normalised space using
-        x_norm = (x - min) / (max - min), so bounds are required for all
-        optimised keys and are used as normalisation anchors.
-        You may provide 'omega' bounds as linear bounds; these are converted
-        to 'log_omega' bounds internally.
+        Parameters that require bounds here (if optimised): r0, mass, inc, pa
+        Provide param_bounds as a dictionary with values as (min, max) tuples for each parameter
     n_epochs : int
         Maximum number of optimisation iterations
     beta1 : float
@@ -1121,7 +1143,7 @@ def fit_streamline(initial_opt_params, fixed_params, streamer, distance_pc,
     loss_method : int
         Loss definition to use. Options:
         - 0: radecvel: optimise RA, Dec, and velocity residuals.
-        - 1: rthetavel: optimise radial distance, polar angle, and velocity residuals.
+        - 1: rthetavel: optimise projected radial distance, polar angle, and velocity residuals.
         Both options use the same model-data matching and overlap penalty.
     v_lsr : float or None
         Systemic velocity (km/s). When provided, drawn as a reference line on the best-fit
@@ -1174,7 +1196,10 @@ def fit_streamline(initial_opt_params, fixed_params, streamer, distance_pc,
     # we perform optimisation in mu-space when either rc or omega is present. conversion is here
     # rotation_key records which of 'rc', 'omega', or 'mu' is input as rotation parameter by user, 
     # so we know which one to convert back to at the end
-    opt_params, fixed_params, param_bounds, rotation_key = with_mu_substituted(opt_params, fixed_params, param_bounds)  
+    opt_params, fixed_params, param_bounds, rotation_key = with_mu_substituted(opt_params, fixed_params, param_bounds)
+
+    # add bounds for angles if they are being optimised
+    param_bounds = auto_fill_angle_bounds(opt_params, param_bounds)
 
 
     opt_param_keys = list(opt_params.keys())

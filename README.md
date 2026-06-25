@@ -123,11 +123,9 @@ model_params, initial_opt_params, fixed_params = gradient_descent.prepare_model_
     initial_opt_params, fixed_params
 )
 
-# --- 3. Set bounds for any of 'r0', 'theta0', 'phi0' in initial_opt_params ---
+# --- 3. Set bounds for 'r0' if it is in initial_opt_params ---
 param_bounds = {
     'r0': (200.0, 10000.0) * u.au,
-    'theta0': (0.0, 180.0) * u.deg,
-    'phi0': (0.0, 360.0) * u.deg,
 }
 
 # --- 4. Fit the streamline ---

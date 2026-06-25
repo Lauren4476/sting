@@ -404,6 +404,10 @@ class TestConvertAndStripBoundUnits:
         result = gd.convert_and_strip_bound_units({})
         assert result == {}
 
+    def test_none_input_returns_empy_dict(self):
+        result = gd.convert_and_strip_bound_units(None)
+        assert result == {}
+
 
 # ===========================================================================
 # clean_model_param_dict
@@ -857,6 +861,77 @@ class TestWithMuSubstituted:
         result_opt, _, _, _ = gd.with_mu_substituted(opt, fixed)
         expected_mu = rc_val / r0_val
         assert pytest.approx(float(result_opt["mu"]), rel=1e-9) == expected_mu
+
+
+# ==========================================================================
+# auto_fill_angle_bounds
+# =========================================================================
+
+class TestAutoFillAngleBounds:
+    """Units tests for the autoatic theta0/phi0 bound filler."""
+
+    def test_theta0_bounds_added_when_optimised(self):
+        opt_params = {"theta0": math.radians(30), "r0": 1000.0}
+        result = gd.auto_fill_angle_bounds(opt_params, {"r0": (500.0, 2000.0)})
+        assert result["theta0"] == (0.0, math.pi)
+    
+    def test_phi0_bounds_added_when_optimised(self):
+        opt_params = {"phi0": math.radians(200), "r0": 1000.0}
+        result = gd.auto_fill_angle_bounds(opt_params, {"r0": (500.0, 2000.0)})
+        assert result["phi0"] == (0.0, 2 * math.pi)
+
+    def test_not_added_when_fixed(self):
+        opt_params = {"r0": 1000.0}
+        result = gd.auto_fill_angle_bounds(opt_params, {"r0": (500.0, 2000.0)})
+        assert "theta0" not in result
+        assert "phi0" not in result
+
+    def test_other_bounds_left_untouched(self):
+        opt_params = {"theta0": math.radians(30), "r0": 1000.0}
+        result = gd.auto_fill_angle_bounds(opt_params, {"r0": (500.0, 2000.0)})
+        assert result["r0"] == (500.0, 2000.0)
+    
+    def test_none_param_bounds_treated_as_empty(self):
+        opt_params = {"theta0": math.radians(30), "phi0": math.radians(200)}
+        result = gd.auto_fill_angle_bounds(opt_params, None)
+        assert result == {"theta0": (0.0, math.pi), "phi0": (0.0, 2 * math.pi)}
+
+    def test_user_supplied_theta0_bounds_overriden(self):
+        opt_params = {"theta0": math.radians(30)}
+        user_bounds = {"theta0": (math.radians(10), math.radians(80))}
+        result = gd.auto_fill_angle_bounds(opt_params, user_bounds)
+        assert result["theta0"] == (0.0, math.pi)  # overridden
+
+    def test_user_supplied_phi0_bounds_overriden(self):
+        opt_params = {"phi0": math.radians(200)}
+        user_bounds = {"phi0": (math.radians(100), math.radians(300))}
+        result = gd.auto_fill_angle_bounds(opt_params, user_bounds)
+        assert result["phi0"] == (0.0, 2 * math.pi)  # overridden
+
+    def test_does_not_mutate_input_param_bounds(self):
+        """ should return a new dict rather than mutating the user's bounds dict"""
+        opt_params = {"theta0": math.radians(30), "phi0": math.radians(200)}
+        user_bounds = {"r0": (500.0, 2000.0)}
+        result = gd.auto_fill_angle_bounds(opt_params, user_bounds)
+        assert "theta0" not in user_bounds
+        assert "phi0" not in user_bounds
+        assert result is not user_bounds
+
+    def test_accepts_set_of_keys(self):
+        """since the function only checks membership, a set of keys should work as well as a dict"""
+        opt_keys = {"theta0", "phi0", "r0"}
+        result = gd.auto_fill_angle_bounds(opt_keys, None)
+        assert result["theta0"] == (0.0, math.pi)
+        assert result["phi0"] == (0.0, 2 * math.pi)
+
+    def test_bounds_in_radians(self):
+        """The bounds returned should be plain floats in radians, not degrees."""
+        opt_params = {"theta0": math.radians(30), "phi0": math.radians(200)}
+        result = gd.auto_fill_angle_bounds(opt_params, None)
+        for key in ("theta0", "phi0"):
+            lo, hi = result[key]
+            assert isinstance(lo, float)
+            assert isinstance(hi, float)
 
 
 # ===========================================================================
