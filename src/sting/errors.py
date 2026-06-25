@@ -258,49 +258,6 @@ def compute_model_sort_idx(best_opt_params, fixed_params, distance_pc, prepared_
 
     return jnp.argsort(model_sort_key), dmetric_model
 
-def estimate_covariance_at_best_fit(
-    best_opt_params,
-    initial_opt_params,
-    fixed_params,
-    data,
-    uncertainties,
-    distance,
-    param_bounds,
-    loss_method=0,
-    gradient_tol=1e-1,
-    rotation_key=None,
-    priors_keys=(),
-    priors_means=(),
-    priors_sigmas=()
-):
-    """ wrapper around estimate_parameter_errors for convenient using after fit_streamline has finished"""
-    opt_keys = list(initial_opt_params.keys())
-    best_for_cov = {k: float(best_opt_params[k]) for k in opt_keys}
-    # prepare data-only quantities once
-    prepared_data = extract_streamline.prepare_data(data, uncertainties, n_elements=len(data[0]))
-    param_bounds = gradient_descent.convert_and_strip_bound_units(param_bounds)
-    best_for_cov_mu, fixed_params_mu, param_bounds, inferred_rotation_key = gradient_descent.with_mu_substituted(best_for_cov, fixed_params, param_bounds)
-    if rotation_key is None and inferred_rotation_key in ('rc', 'omega'):
-        rotation_key = inferred_rotation_key
-    param_bounds = gradient_descent.auto_fill_angle_bounds(best_for_cov_mu, param_bounds)
-    normalisation_spec = gradient_descent.build_normalisation_spec(best_for_cov_mu, param_bounds)
-    param_errors, cov, cov_transformed_dict = estimate_parameter_errors(
-        best_for_cov_mu,
-        fixed_params_mu,
-        distance,
-        prepared_data,
-        loss_method=loss_method,
-        gradient_tol=gradient_tol,
-        normalisation_spec=normalisation_spec,
-        rotation_key=rotation_key,
-        priors_keys=priors_keys,
-        priors_means=priors_means,
-        priors_sigmas=priors_sigmas
-    )
-    mu_opt_keys = list(best_for_cov_mu.keys())
-    return opt_keys, param_errors, cov, cov_transformed_dict, best_for_cov_mu, fixed_params_mu, mu_opt_keys
-
-
 def estimate_parameter_errors(
     best_opt_params,
     fixed_params,

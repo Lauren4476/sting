@@ -107,6 +107,32 @@ STREAMLINE_MODEL_PARAM_KEYS = (
     'v_lsr',
 )
 
+#### Return types
+
+# Contains all the information about the covariance matrix and errors of the fitted model
+CovarianceResult = namedtuple(
+    'CovarianceResult',
+    [
+        'covariance',       # 2-D array: physical-space covariance matrix from the Hessian, ordered consistently with opt_keys / best_params / fixed_params.
+        'opt_keys',         # list[str]: parameter names for rows/cols of covariance (mu-substituted, i.e. 'mu' in place of 'rc'/'omega').
+        'best_opt_params',  # dict: best-fit values in the mu-substituted parameterisation.
+        'fixed_params',     # dict: fixed parameters in the mu-substituted parameterisation.
+        'param_errors',     # dict: 1-sigma errors keyed by opt_keys names, or None.
+        'transformed_cov',  # dict or None: Jacobian-transformed result when 'mu' was substituted for 'rc'/'omega'; keys are 'keys', 'cov', 'errors'.
+    ]
+)
+
+# Contains all the information about the model fit result, including best-fit parameters
+FitResult = namedtuple(
+    'FitResult',
+    [
+        'best_opt_params',      # dict: best-fit optimised parameters in the original user-supplied parameterisation (rc/omega restored).
+        'loss_history',     # list[float]: loss value at every epoch.
+        'param_errors',     # dict or None: 1-sigma errors in display parameterisation, or None if uncertainty estimation failed.
+        'covariance_result',       # CovarianceResult or None: full covariance information needed for sampling, or None if estimation failed.
+    ]
+)
+
 def convert_and_strip_bound_units(bounds):
     """
     Convert bounds that are astropy quantitiesinto canonical units,
@@ -1298,9 +1324,17 @@ def fit_streamline(initial_opt_params, fixed_params, streamer, distance_pc,
 
     Returns:
     --------   
-    dict: optimised parameters (same keys as initial_opt_params), also including
-        derived 'omega' when 'mu', 'mass', and 'r0' are available
-    list: Loss history (indexed by epoch: loss_history[i] = loss at epoch i)
+    FitResult namedtuple with fields:
+    - best_opt_params : dict of best-fit optimised parameters (physical/log units)
+    - loss_history : list of loss values at each epoch (float)
+    - param_errors: dict of estimated 1-sigma uncertainties for each optimised parameter in the display parameterisation (or None if uncertainty estimation failed)
+    - covariance_result: CovarianceResult or None: full covariance information needed for sampling, or None if estimation failed. Fields:
+        - covariance : 2D array of covariance matrix in physical/log units
+        - opt_keys: list of parameter keys corresponding to covariance_matrix rows/columns
+        - best_opt_params: dict of best-fit optimised parameters (physical/log units)
+        - fixed_params: dict of fixed parameters (physical/log units)
+        - param_errors: dict of 1-sigma parameter uncertainties (physical/log units)
+        - transformed_cov: dict of Jacobian-transformed covariance when 'rc'/'omega' was substutied by 'mu', keys are 'keys', 'cov', 'errors'
     """
     # lazy imports to avoid circular imports
     from . import outputs
@@ -1712,8 +1746,21 @@ def fit_streamline(initial_opt_params, fixed_params, streamer, distance_pc,
             transformed_cov_result=cov_transformed_dict,
         )
 
-
-
-
-
-    return display_opt_params, loss_history, display_param_errors
+    # save results to CovarianceResult and FitResult namedtuples
+    cov_result = None
+    if cov_matrix is not None:
+        cov_result = CovarianceResult(
+            covariance=cov_matrix,
+            opt_keys=list(ordered_best_opt_params.keys()),
+            best_opt_params=ordered_best_opt_params,
+            fixed_params=fixed_params,
+            param_errors=param_errors,
+            transformed_cov=cov_transformed_dict
+        )
+    
+    return FitResult(
+        best_opt_params=display_opt_params,
+        loss_history=loss_history,
+        param_errors=display_param_errors,
+        covariance_result=cov_result,
+    )

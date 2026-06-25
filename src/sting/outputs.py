@@ -1432,53 +1432,48 @@ def plot_param_correlations(param_names, covariance, annotate=True, save_folder=
         plt.close(fig)
 
 def plot_streamline_covariance_samples(best_opt_params,
-                                       initial_opt_params,
                                        fixed_params,
                                        data,
                                        uncertainties,
                                        distance,
-                                       param_bounds,
-                                       loss_method,
-                                       gradient_tol,
+                                       covariance_result,
                                        v_lsr=None,
                                        n_samples=100,
                                        save_folder=None):
     """
-    Compute covariance, sample parameter sets from it, evaluate streamlines from those sets, and plot them all together
+    Sample parameter sets from the covariance matrix, evaluate streamlines from those sets, and plot them all together
+
+        Parameters
+    ----------
+    best_opt_params : dict
+        Best-fit optimised parameters in the original user-supplied parameterisation
+        (e.g. with 'rc' or 'omega'). Used only to evaluate and plot the best-fit streamline.
+    fixed_params : dict
+        Fixed model parameters in the original user-supplied parameterisation.
+        Used only to evaluate and plot the best-fit streamline.
+    data : tuple of arrays (ra_data, dec_data, v_data)
+    uncertainties : tuple of arrays (ra_sigma, dec_sigma, v_sigma)
+    distance : float, distance in pc
+    covariance_result : namedtuple from 
+        result = fit_streamline(...)
+        covariance_result = result.cov_result
+    v_lsr : float or None, km/s
+    n_samples : int
+    save_folder : str or None
     """
-    #lazy import to avoid circular import
-    from . import errors
-    opt_keys, param_errors, cov, cov_transformed_dict, best_for_cov_mu, fixed_params_mu, mu_opt_keys = errors.estimate_covariance_at_best_fit(
-        best_opt_params,
-        initial_opt_params,
-        fixed_params,
-        data,
-        uncertainties,
-        distance,
-        param_bounds,
-        loss_method=loss_method,
-        gradient_tol=gradient_tol
-    )
-
-    print("=== COVARIANCE DIAGNOSIS ===")
-    print("mu_opt_keys:", mu_opt_keys)
-    print("best_for_cov_mu:", best_for_cov_mu)
-    print("Diagonal of cov (variances):", np.diag(np.asarray(cov)))
-    print("1-sigma errors from cov diagonal:", np.sqrt(np.abs(np.diag(np.asarray(cov)))))
-    print("param_errors:", param_errors)
-
+    cov_best_params = covariance_result.best_opt_params
+    cov_opt_keys = covariance_result.opt_keys
+    cov_fixed_params = covariance_result.fixed_params
+    cov = covariance_result.covariance
     _, streamline_samples = generate_streamline_samples(
-        best_opt_params=best_for_cov_mu,   
+        best_opt_params=cov_best_params,
         covariance=cov,
-        opt_keys=mu_opt_keys,              
-        fixed_params=fixed_params_mu,      
+        opt_keys=cov_opt_keys,
+        fixed_params=cov_fixed_params,
         distance=distance,
-        param_bounds=None,                 
+        param_bounds=None,
         n_samples=n_samples
     )
-
-    # best_for_cov = {key: float(best_opt_params[key]) for key in opt_keys}
-
 
     fig, (ax_sky, ax_v) = plt.subplots(1, 2, figsize=(10, 5))
     ra_data, dec_data, v_data = data
@@ -1589,8 +1584,6 @@ def evaluate_streamlines_samples(param_samples, opt_keys, fixed_params, distance
             key: float(value)
             for key, value in zip(opt_keys, sample)
         }
-        if len(streamlines) == 0:
-            print(f"sample_params: {sample_params}")
         sample_params_full, _, _ = gradient_descent.prepare_model_params(sample_params, fixed_params)
         ra, dec, vel, valid_mask, err = gradient_descent.forward_model(sample_params_full, distance)
         ra = np.asarray(ra, dtype=float)
@@ -1640,11 +1633,6 @@ def sample_parameter_sets_from_covariance(best_params, covariance, opt_keys, par
         if key in param_bounds:
             low, high = param_bounds[key]
             samples[:, j] = np.clip(samples[:, j], low, high)
-
-    print("=== SAMPLING DIAGNOSIS ===")
-    print("mean (mu):", mu)
-    print("sample[0]:", samples[0])
-    print("sample[0] - mean:", samples[0] - mu)
 
     return samples
 
