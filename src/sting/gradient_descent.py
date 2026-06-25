@@ -77,6 +77,8 @@ ANGLE_KEYS = {'theta0', 'phi0', 'inc', 'pa'}
 ANGLE_BOUNDS_RAD = {
     'theta0': (0.0, jnp.pi),
     'phi0': (0.0, 2 * jnp.pi),
+    'inc': (-jnp.pi/2, jnp.pi/2),
+    'pa': (0.0, 2 * jnp.pi),
 }
 
 DISPLAY_UNITS = {
@@ -361,7 +363,7 @@ def build_normalisation_spec(opt_params, param_bounds):
     if param_bounds is None:
         raise ValueError(
             "param_bounds is required because optimisation is performed in normalised space. "
-            "Provide bounds for every parameter you want to optimise (except v_r0, which is handled separately)."
+            "Provide bounds for 'mass', 'r0' if you are optimising these."
         )
  
     missing = []
@@ -440,12 +442,19 @@ def denormalise_opt_params(norm_opt_params, normalisation_spec):
             continue
         offset = normalisation_spec[key]['offset']
         scale = normalisation_spec[key]['scale']
-        if key == 'phi0':
-            # special handling for phi0 because circular
+        if key == 'phi0' or key == 'pa':
+            # special handling for phi0, pa because circular
             denormalised[key] = jnp.mod(to_float64(value) * scale + offset, 2*jnp.pi)
         else:
             denormalised[key] = to_float64(value) * scale + offset
     return denormalised
+
+def log_header(param_key):
+    if param_key == 'mu':
+        return 'mu'
+    unit = CANONICAL_UNITS.get(param_key)
+    return f'{param_key} [{unit}]' if unit is not None else param_key
+
 
 
 def get_rotation_param_key(opt_params, fixed_params):
@@ -516,7 +525,7 @@ def with_mu_substituted(opt_params, fixed_params, param_bounds=None):
     return opt_params, fixed_params, param_bounds, rotation_key
 
 def auto_fill_angle_bounds(opt_params, param_bounds):
-    """Automatically fill in bounds for theta0 and phi0, since their ranges are fixed by physics.
+    """Automatically fill in bounds for theta0, phi0, inc, pa, since their ranges are fixed by physics.
     If the user supplied bounds for these parameters by mistake, print a notice and ignore them."""
     if param_bounds is None:
         param_bounds = {}
@@ -1223,7 +1232,7 @@ def evaluate_initial_guess(
 
 
 def fit_streamline(initial_opt_params, fixed_params, streamer, distance_pc,
-                   learning_rate=0.01, param_bounds=None, n_epochs=1000,
+                   learning_rate=0.005, param_bounds=None, n_epochs=1000,
                    beta1=0.9, beta2=0.999,
                    info_every=100, loss_threshold=None, loss_threshold_epochs=1,
                    gradient_tol=None, gradient_tol_epochs=1,
@@ -1459,15 +1468,16 @@ def fit_streamline(initial_opt_params, fixed_params, streamer, distance_pc,
 
         log_file = os.path.join(save_folder, 'optimisation_log.csv')
         log_file = open(log_file, 'w', newline='')
-        # Create header: epoch, loss, then all optimisable params
-        fieldnames = ['epoch', 'loss'] + opt_param_keys
-        all_param_keys = set(opt_param_keys) | set(fixed_params.keys())
-        if 'mu' in all_param_keys:
-            # also log derived rc and omega when mu is present for convenience in comparing to old codes
-            if 'rc' not in fieldnames:
-                fieldnames.append('rc')
-            if 'omega' not in fieldnames:
-                fieldnames.append('omega')
+    # Create header: epoch, loss, then all optimisable params
+    fieldnames = ['epoch', 'loss'] + [log_header(k) for k in opt_param_keys]
+
+    all_param_keys = set(opt_param_keys) | set(fixed_params.keys())
+    if 'mu' in all_param_keys:
+        # also log derived rc and omega when mu is present for convenience
+        if log_header('rc') not in fieldnames:
+            fieldnames.append(log_header('rc'))
+        if log_header('omega') not in fieldnames:
+            fieldnames.append(log_header('omega'))
         log_writer = csv.DictWriter(log_file, fieldnames=fieldnames)
         log_writer.writeheader()
         log_file.flush()
@@ -1509,8 +1519,12 @@ def fit_streamline(initial_opt_params, fixed_params, streamer, distance_pc,
     if log_writer is not None:
         row = {'epoch': 0, 'loss': initial_loss}
         for key in opt_param_keys:
-            row[key] = float(opt_params[key])
+            row[log_header(key)] = float(opt_params[key])
         row = add_rc_omega_to_log(row, opt_params, fixed_params, all_param_keys)
+        if 'rc' in row:
+            row[log_header('rc')] = row.pop('rc')
+        if 'omega' in row:
+            row[log_header('omega')] = row.pop('omega')
         log_writer.writerow(row)
         log_file.flush()
     
@@ -1583,8 +1597,14 @@ def fit_streamline(initial_opt_params, fixed_params, streamer, distance_pc,
             if log_writer is not None:
                 row = {'epoch': epoch, 'loss': loss_value}
                 for key in opt_param_keys:
-                    row[key] = float(opt_params[key])
+                    row[log_header(key)] = float(opt_params[key])
+
                 row = add_rc_omega_to_log(row, opt_params, fixed_params, all_param_keys)
+
+                if 'rc' in row:
+                    row[log_header('rc')] = row.pop('rc')
+                if 'omega' in row:
+                    row[log_header('omega')] = row.pop('omega')
                 log_writer.writerow(row)
                 log_file.flush()
         

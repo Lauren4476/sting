@@ -18,7 +18,7 @@ With STING you can:
 
 1. **Extract a 1D streamline from a spectral cube.** Given a PPV cube containing candidate streamer emission, and the coordinates of its protostar, STING reduces the PPV cube to a set of `npoints` representative (RA offset, Dec offset, velocity) points with corresponding uncertainties
 2. **Model a streamline.** The streamline model used by STING is taken from [Mendoza et al. (2009)](https://doi.org/10.1111/j.1365-2966.2008.14210.x) — a ballistic model of rotating infall, dominated by the gravitational force of a sink mass at the star position.
-3. **Quickly fit the model to your data.** Streamline parameters are optimised with the Adam optimiser to minimise a chi-squared loss between the model and the observed streamline. Current parameters supported for optimisation: `r0`, `theta0`, `phi0`, `v_r0`, `omega` / `rc`, `mass`, `inc`, `pa`. You can optimise any combination of these.
+3. **Quickly fit the model to your data.** Streamline parameters are optimised with the Adam optimiser to minimise a chi-squared loss between the model and the observed streamline. Current parameters supported for optimisation: `r0`, `theta0`, `phi0`, `v_r0`, `omega` or `rc`, `mass`, `inc`, `pa`. You can optimise any combination of these.
 4. **Quantify uncertainties.** Parameter uncertainties are estimated from the Hessian of the loss at the best-fit point, and propagated into the model (e.g. as "streamline spaghetti" plots).
 5. **Visualise the result.** Pre-built plotting functions include: morphology, velocity vs. projected radius on sky plane, loss curves, parameter correlation and uncertainty sampling, and per-epoch animations of the fit converging.
 
@@ -123,12 +123,10 @@ model_params, initial_opt_params, fixed_params = gradient_descent.prepare_model_
     initial_opt_params, fixed_params
 )
 
-# --- 3. Set bounds for 'r0', 'mass', 'inc', 'pa' if any of these are in initial_opt_params ---
+# --- 3. Set bounds for 'r0', 'mass', if any of these are in initial_opt_params ---
 param_bounds = {
     'r0': (200.0, 10000.0) * u.au,
     'mass': (3.0, 5.0) * u.Msun,
-    'inc': -45 * u.deg,
-    'pa': 194 * u.deg
 }
 
 # --- 4. (optional) It is recommended to set priors for 'mass', 'inc', 'pa' if any of these are in initial_opt_params, to help break degeneracy ---

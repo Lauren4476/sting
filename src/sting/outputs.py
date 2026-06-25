@@ -253,11 +253,14 @@ def _ensure_clean_dir(path):
                 pass
 
 def _opt_params_from_log(optimisation_log):
+    """Return bare parameter names from the log, stripping any unit suffixes"""
     skip = ['epoch', 'loss']
     cols = [c for c in optimisation_log.columns if c not in skip]
-    if 'mu' in cols:
-        cols = [c for c in cols if c not in ('rc', 'omega')]
-    return cols
+    # Strip unit suffixes to get bare param name
+    bare = [c.split(' [')[0] for c in cols]
+    if 'mu' in bare:
+        bare = [b for b in bare if b not in ('rc', 'omega')]
+    return bare
 
 
 def create_video_from_images(save_folder, input_pattern, output_name, fps=5):
@@ -350,6 +353,7 @@ def make_morphology_background(pc_coords, metric_boundaries, ra_lim, dec_lim, fi
 def plot_morphology_by_epoch(
     gradient_descent,
     fixed_params,
+    initial_opt_params,
     distance,
     streamer=None,
     n_points=None,
@@ -365,7 +369,9 @@ def plot_morphology_by_epoch(
     except FileNotFoundError:
         print(f"Error: Could not find 'optimisation_log.csv' in {save_folder}")
         return
+    column_map = {c.split(' [')[0]: c for c in optimisation_log.columns}
     param_names = _opt_params_from_log(optimisation_log)
+    fixed_params_clean, initial_opt_params = gradient_descent.sanitize_param_partition(fixed_params, initial_opt_params, require_nonempty_opt=False)
 
     epochs = optimisation_log['epoch'].values
 
@@ -374,9 +380,9 @@ def plot_morphology_by_epoch(
     for idx, epoch in enumerate(epochs):
 
         row = optimisation_log.iloc[idx]
-        opt_params_epoch = {param: float(row[param]) for param in param_names}
-        opt_params_epoch_full, opt_params_epoch, fixed_params = gradient_descent.prepare_model_params(opt_params_epoch, fixed_params)
-        ra_model, dec_model, v_model, valid_mask_model, err = gradient_descent.forward_model(opt_params_epoch_full, distance)
+        opt_params_epoch = {param: float(row[column_map[param]]) for param in param_names}
+        model_params_epoch = {**fixed_params_clean, **opt_params_epoch}
+        ra_model, dec_model, v_model, valid_mask_model, err = gradient_descent.forward_model(model_params_epoch, distance)
         valid_mask_model = valid_mask_model.astype(bool)
 
         (ra_model_interp, dec_model_interp, _, valid, model_keep, dmetric_model, matching_trace) = gradient_descent.checked_match_model_to_data_curve(
@@ -608,6 +614,7 @@ def plot_morphology(
 def plot_ra_vel_by_epoch(
     gradient_descent,
     fixed_params,
+    initial_opt_params,
     distance,
     streamer=None,
     save_folder="sting_results",
@@ -621,7 +628,9 @@ def plot_ra_vel_by_epoch(
     except FileNotFoundError:
         print(f"Error: Could not find 'optimisation_log.csv' in {save_folder}")
         return
+    column_map = {c.split(' [')[0]: c for c in optimisation_log.columns}
     param_names = _opt_params_from_log(optimisation_log)
+    fixed_params_clean, initial_opt_params = gradient_descent.sanitize_param_partition(fixed_params, initial_opt_params, require_nonempty_opt=False)
 
     epochs = optimisation_log['epoch'].values
 
@@ -631,9 +640,9 @@ def plot_ra_vel_by_epoch(
     for idx, epoch in enumerate(epochs):
 
         row = optimisation_log.iloc[idx]
-        opt_params_epoch = {p: float(row[p]) for p in param_names}
-        opt_params_epoch_full, _, _ = gradient_descent.prepare_model_params(opt_params_epoch, fixed_params)
-        ra_model, dec_model, v_model, valid_mask_model, err = gradient_descent.forward_model(opt_params_epoch_full, distance)
+        opt_params_epoch = {param: float(row[column_map[param]]) for param in param_names}
+        model_params_epoch = {**fixed_params_clean, **opt_params_epoch}
+        ra_model, dec_model, v_model, valid_mask_model, err = gradient_descent.forward_model(model_params_epoch, distance)
         valid_mask_model = valid_mask_model.astype(bool)
         ra_model_interp, _, v_model_interp, valid, model_keep, dmetric_model, matching_trace = (
             gradient_descent.checked_match_model_to_data_curve(ra_model, dec_model, v_model, valid_mask_model, streamer.ra_data, streamer.dec_data)
@@ -774,6 +783,7 @@ def plot_ra_vel(
 def plot_dec_vel_by_epoch(
     gradient_descent,
     fixed_params,
+    initial_opt_params,
     distance,
     streamer=None,
     save_folder="sting_results",
@@ -787,7 +797,9 @@ def plot_dec_vel_by_epoch(
     except FileNotFoundError:
         print(f"Error: Could not find 'optimisation_log.csv' in {save_folder}")
         return
+    column_map = {c.split(' [')[0]: c for c in optimisation_log.columns}
     param_names = _opt_params_from_log(optimisation_log)
+    fixed_params_clean, initial_opt_params = gradient_descent.sanitize_param_partition(fixed_params, initial_opt_params, require_nonempty_opt=False)
 
     epochs = optimisation_log['epoch'].values
 
@@ -797,9 +809,9 @@ def plot_dec_vel_by_epoch(
     for idx, epoch in enumerate(epochs):
 
         row = optimisation_log.iloc[idx]
-        opt_params_epoch = {p: float(row[p]) for p in param_names}
-        opt_params_epoch_full, _, _ = gradient_descent.prepare_model_params(opt_params_epoch, fixed_params)
-        ra_model, dec_model, v_model, valid_mask_model, err = gradient_descent.forward_model(opt_params_epoch_full, distance)
+        opt_params_epoch = {param: float(row[column_map[param]]) for param in param_names}
+        model_params_epoch = {**fixed_params_clean, **opt_params_epoch}
+        ra_model, dec_model, v_model, valid_mask_model, err = gradient_descent.forward_model(model_params_epoch, distance)
         valid_mask_model = valid_mask_model.astype(bool)
         ra_model_interp, dec_model_interp, v_model_interp, valid, model_keep, dmetric_model, matching_trace = (
             gradient_descent.checked_match_model_to_data_curve(ra_model, dec_model, v_model, valid_mask_model, streamer.ra_data, streamer.dec_data)
@@ -1228,6 +1240,7 @@ def plot_vel_radius(
 def plot_vel_radius_by_epoch(
     gradient_descent,
     fixed_params,
+    initial_opt_params,
     distance,
     streamer,
     *,
@@ -1244,7 +1257,9 @@ def plot_vel_radius_by_epoch(
     except FileNotFoundError:
         print(f"Error: Could not find 'optimisation_log.csv' in {save_folder}")
         return
+    column_map = {c.split(' [')[0]: c for c in optimisation_log.columns}
     param_names = _opt_params_from_log(optimisation_log)
+    fixed_params_clean, initial_opt_params = gradient_descent.sanitize_param_partition(fixed_params, initial_opt_params, require_nonempty_opt=False)
     
     epochs = optimisation_log['epoch'].values
     epoch_models = []
@@ -1261,12 +1276,9 @@ def plot_vel_radius_by_epoch(
 
     for idx, epoch in enumerate(epochs):
         row = optimisation_log.iloc[idx]
-        opt_params_epoch = {p: float(row[p]) for p in param_names}
-        opt_params_epoch_full, _, _ = gradient_descent.prepare_model_params(opt_params_epoch, fixed_params)
-        ra_model, dec_model, v_model, valid_mask_model, err = gradient_descent.forward_model(
-            opt_params_epoch_full,
-            distance,
-        )
+        opt_params_epoch = {param: float(row[column_map[param]]) for param in param_names}
+        model_params_epoch = {**fixed_params_clean, **opt_params_epoch}
+        ra_model, dec_model, v_model, valid_mask_model, err = gradient_descent.forward_model(model_params_epoch, distance)
 
         valid_mask_model = valid_mask_model.astype(bool)
 
