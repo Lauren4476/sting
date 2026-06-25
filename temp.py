@@ -1259,7 +1259,8 @@ class TestBuildTraceRow:
         # build_trace_row uses .get(..., nan) so the key is still present
         assert "chi2_prior" in row
         assert math.isnan(row["chi2_prior"])
-        
+
+
 # ===========================================================================
 # trace_tree_to_python
 # ===========================================================================

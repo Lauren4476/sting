@@ -116,7 +116,9 @@ def match_model_to_data_curve_hsafe(
     valid = data_valid
     return ra_interp, dec_interp, v_interp, valid
 
-def chi2_loss_hsafe(model_params, distance_pc, prepared_data, loss_method, model_sort_idx, dmetric_model_frozen,npoints=10000):
+@jax.jit(static_argnames=("loss_method", "npoints", "priors_keys", "priors_means", "priors_sigmas"))
+def chi2_loss_hsafe(model_params, distance_pc, prepared_data, loss_method, model_sort_idx, dmetric_model_frozen,npoints=10000,
+                    priors_keys=(), priors_means=(), priors_sigmas=()):
     """Second-derivative-safe version of chi2_loss, using match_model_to_data_curve_hsafe"""
     distance_pc = jnp.asarray(distance_pc, dtype=jnp.float64)
 
@@ -136,7 +138,8 @@ def chi2_loss_hsafe(model_params, distance_pc, prepared_data, loss_method, model
     model_params = dict(model_params)
     model_params['mu'] = mu
 
-    (x, y, z), (vx, vy, vz), valid_mask = stream_lines_grad.xyz_stream(
+    xyz_stream_checked = checkify.checkify(stream_lines_grad.xyz_stream)
+    errs, ((x, y, z), (vx, vy, vz), valid_mask) = xyz_stream_checked(
         mass=model_params['mass'],
         r0=model_params['r0'],
         theta0=model_params['theta0'],
@@ -195,7 +198,11 @@ def chi2_loss_hsafe(model_params, distance_pc, prepared_data, loss_method, model
         chi2_r = jnp.sum(valid_weights * ((r_proj_data - r_proj_model) / sigma_r)**2)
         chi2_theta = jnp.sum(valid_weights * (dtheta / sigma_theta)**2)
         chi2_total = chi2_r + chi2_theta + chi2_v
-    
+
+    # add prior penalty if any
+    chi2_prior = gradient_descent.compute_prior_penalty(model_params, priors_means, priors_sigmas, priors_keys)
+    chi2_total = chi2_total + chi2_prior
+
     return chi2_total
 
 def compute_model_sort_idx(best_opt_params, fixed_params, distance_pc, prepared_data, npoints=10000):
@@ -262,6 +269,9 @@ def estimate_covariance_at_best_fit(
     loss_method=0,
     gradient_tol=1e-1,
     rotation_key=None,
+    priors_keys=(),
+    priors_means=(),
+    priors_sigmas=()
 ):
     """ wrapper around estimate_parameter_errors for convenient using after fit_streamline has finished"""
     opt_keys = list(initial_opt_params.keys())
@@ -283,6 +293,9 @@ def estimate_covariance_at_best_fit(
         gradient_tol=gradient_tol,
         normalisation_spec=normalisation_spec,
         rotation_key=rotation_key,
+        priors_keys=priors_keys,
+        priors_means=priors_means,
+        priors_sigmas=priors_sigmas
     )
     mu_opt_keys = list(best_for_cov_mu.keys())
     return opt_keys, param_errors, cov, cov_transformed_dict, best_for_cov_mu, fixed_params_mu, mu_opt_keys
@@ -299,6 +312,9 @@ def estimate_parameter_errors(
     best_norm_opt_params=None,
     rotation_key=None,
     npoints=10000,
+    priors_keys=(),
+    priors_means=(),
+    priors_sigmas=()
 ):
     """
     Estimate parameter uncertainties using Hessian of chi2 loss.
@@ -320,6 +336,8 @@ def estimate_parameter_errors(
         If not provided, will be computed from best_opt_params and normalisation_spec, but providing it can save a redundant computation
     rotation_key : str or None
         If provided, must be 'rc' or 'omega'. Used to transform covariance matrix from optimised 'mu' to rotation_key
+    priors_keys, priors_means, priors_sigmas : tuples
+        Parallel tuples of prior information for optimised parameters. If provided, a prior penalty is added to the chi2 loss before computing the Hessian. If not provided, no prior penalty is added.
 
     Returns
     -------
@@ -385,6 +403,9 @@ def estimate_parameter_errors(
             model_sort_idx=model_sort_idx,
             dmetric_model_frozen=dmetric_model,
             npoints=npoints,
+            priors_keys=priors_keys,
+            priors_means=priors_means,
+            priors_sigmas=priors_sigmas
         )
         return chi2_total
     
@@ -402,6 +423,9 @@ def estimate_parameter_errors(
             model_sort_idx=model_sort_idx,
             dmetric_model_frozen=dmetric_model,
             npoints=npoints,
+            priors_keys=priors_keys,
+            priors_means=priors_means,
+            priors_sigmas=priors_sigmas
         )
         return chi2_total
     
@@ -418,6 +442,9 @@ def estimate_parameter_errors(
                 distance_pc,
                 prepared_data,
                 loss_method=loss_method,
+                priors_keys=priors_keys,
+                priors_means=priors_means,
+                priors_sigmas=priors_sigmas
             )
             return chi2_total        
 

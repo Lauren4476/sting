@@ -32,8 +32,8 @@ BIG_NEG = -1e30
 LOSS_METHOD_CHOICES = [0, 1]
 
 LOSS_METHOD_COMPONENT_KEYS = {
-    0: ('chi2_ra', 'chi2_dec', 'chi2_v'), #radecvel
-    1: ('chi2_r', 'chi2_theta', 'chi2_v'), #rthetavel
+    0: ('chi2_ra', 'chi2_dec', 'chi2_v', 'chi2_prior'), #radecvel
+    1: ('chi2_r', 'chi2_theta', 'chi2_v', 'chi2_prior'), #rthetavel
 }
 
 TRACE_COMMON_FIELDNAMES = [
@@ -525,6 +525,105 @@ def format_param(key, value):
         suffix = ""
     return f"{val:.6g}{suffix}"
 
+def validate_priors(priors, opt_params, fixed_params):
+    """Check the validity of the priors dictionary supplied by the user.
+
+    priors must be a dict of the form::
+
+        {param_name: (mean, sigma) * u.Unit, ...}
+
+    where mean and sigma are plain floats in the same canonical units as the rest of the code,
+    or a length-2 astropy Quantity with the appropriate units.  
+    
+    Only parameters that are being optimised (i.e. keys present in opt_params) can have priors.
+
+    Parameters
+    ----------
+    priors : dict or None
+    opt_params : dict : optimisable parameters (after sanitisation)
+    fixed_params : dict :fixed parameters (after sanitisation)
+
+    Returns
+    -------
+    dict : validated priors, or {} if None.
+    """
+    if priors is None:
+        return {}
+    if not isinstance(priors, dict):
+        raise TypeError(f"priors must be a dict, got {type(priors).__name__}.")
+
+    validated = {}
+    for key, val in priors.items():
+        if key not in STREAMLINE_MODEL_PARAM_KEYS:
+            raise KeyError(
+                f"Unknown parameter '{key}' in priors. "
+                f"Supported keys are: {list(STREAMLINE_MODEL_PARAM_KEYS)}"
+            )
+        if key in fixed_params:
+            raise ValueError(
+                f"Parameter '{key}' is fixed and cannot have a prior. "
+                "Move it to initial_opt_params if you want to optimise it with a prior."
+            )
+        if key not in opt_params:
+            raise ValueError(
+                f"Parameter '{key}' has a prior but is not being optimised. "
+                "Add it to initial_opt_params or remove it from priors."
+            )
+        if isinstance(val, u.Quantity) and val.shape == (2,):
+            mean = val[0]
+            sigma = val[1]
+        elif isinstance(val, (tuple, list)) and len(val) == 2:
+            mean, sigma = val
+        else:
+            raise ValueError(
+                f"Prior for '{key}' must be a 2-element (mean, sigma) tuple, "
+                f"or a length-2 Quantity e.g. (4.0, 1.0) * u.Msun. Got: {val!r}"
+            )
+        mean, sigma = val
+
+        if isinstance(mean, u.Quantity):
+            if key not in CANONICAL_UNITS:
+                raise ValueError(f"No canonical units defined for '{key}'.")
+            mean = float(mean.to(CANONICAL_UNITS[key]).value)
+        else:
+            mean = float(mean) # assume it's already in the right units
+        if isinstance(sigma, u.Quantity):
+            if key not in CANONICAL_UNITS:
+                raise ValueError(f"No canonical units defined for '{key}'.")
+            sigma = float(sigma.to(CANONICAL_UNITS[key]).value)
+        else:
+            sigma = float(sigma) # assume it's already in the right units
+        if sigma <= 0:
+            raise ValueError(
+                f"Prior sigma for '{key}' must be positive, got {sigma}."
+            )
+        validated[key] = (mean, sigma)
+    return validated
+
+
+@jax.jit(static_argnames=('priors_keys',))
+def compute_prior_penalty(model_params, priors_means, priors_sigmas, priors_keys):
+    """Compute the Gaussian prior penalty term: 
+        sum_k ((theta_k - mu_k) / sigma_k)^2.
+
+    Parameters
+    ----------
+    model_params : dict: physical model parameters
+    priors_means : tuple of float: prior means, one per prior key
+    priors_sigmas : tuple of float: prior sigmas, one per prior key
+    priors_keys : tuple of str: corresponding prior keys (parameter names)
+
+    Returns
+    -------
+    scalar JAX array : the prior chi-squared contribution
+    """
+    penalty = jnp.asarray(0.0, dtype=jnp.float64)
+    for key, mu_p, sigma_p in zip(priors_keys, priors_means, priors_sigmas):
+        mu_p = jnp.asarray(mu_p, dtype=jnp.float64)
+        sigma_p = jnp.asarray(sigma_p, dtype=jnp.float64)
+        penalty = penalty + ((model_params[key] - mu_p) / sigma_p) ** 2
+    return penalty
+
 def add_rc_omega_to_log(row, opt_params, fixed_params, all_param_keys):
     """Add rc and omega to the log row for user-friendly output, converting from mu if necessary"""
     if 'mu' not in all_param_keys:
@@ -833,16 +932,24 @@ def checked_match_model_to_data_curve(*args, **kwargs):
     errors.throw()
     return result
 
-@jax.jit(static_argnames=("loss_method", "npoints"))
+@jax.jit(static_argnames=("loss_method", "npoints", "priors_keys", "priors_means", "priors_sigmas"))
 def chi2_loss(
     model_params,
     distance_pc,
     prepared_data,
     loss_method=0,
     npoints=10000,
+    priors_keys=(),
+    priors_means=(),
+    priors_sigmas=()
 ):
     """Generates model via forward model and calculates loss between data and model.
-    Returns (chi2_total, loss_trace, err) where err is a checkify"""
+    Returns (chi2_total, loss_trace, err) where err is a checkify.
+    
+    chi2_loss = chi2_data + chi2_priors.
+    
+    chi2_priors is the sum of Gaussian prior penalty terms for any optimised parameters where priors were given.
+    See compute_prior_penalty"""
  
     loss_method = check_loss_method(loss_method)
  
@@ -939,12 +1046,17 @@ def chi2_loss(
         model_metric_non_monotonic_count = to_float64(0.0)
  
     model_metric_span = d_model_sorted[-1] - d_model_sorted[0] if d_model_sorted.size > 1 else to_float64(0.0)
+
+    # compute and add the prior penalty term to the total chi2 if priors are provided
+    chi2_prior = compute_prior_penalty(model_params, priors_means, priors_sigmas, priors_keys)
+    chi2_total = chi2_total + chi2_prior
  
     if loss_method == 0:
         chi2_components = {
             'chi2_ra': chi2_ra,
             'chi2_dec': chi2_dec,
             'chi2_v': chi2_v,
+            'chi2_prior': chi2_prior,
             'overlap_width': overlap_max - overlap_min,
             'chi2_total': chi2_total,
         }
@@ -953,6 +1065,7 @@ def chi2_loss(
             'chi2_r': chi2_r,
             'chi2_theta': chi2_theta,
             'chi2_v': chi2_v,
+            'chi2_prior': chi2_prior,
             'overlap_width': overlap_max - overlap_min,
             'chi2_total': chi2_total,
         }
@@ -1005,6 +1118,7 @@ def evaluate_initial_guess(
     distance_pc,
     n_elements=10,
     loss_method=0,
+    priors=None,
 ):
     """
     Run the forward model and compute chi2 loss for the initial parameter guess.
@@ -1030,6 +1144,10 @@ def evaluate_initial_guess(
         Loss definition to use. Options:
         - 0: radecvel — RA, Dec, and velocity residuals.
         - 1: rthetavel — radial distance, polar angle, and velocity residuals.
+    priors : dict or None
+        Optional Gaussian priors on optimised parameters, in the form
+        {param_name: (mean, sigma), ...}. Only optimised parameters can have priors.
+        Mean and sigma must be in the same canonical units as the rest of the code
  
     Returns
     -------
@@ -1048,7 +1166,11 @@ def evaluate_initial_guess(
     """
     loss_method = check_loss_method(loss_method)
  
-    model_params, _, _ = prepare_model_params(initial_opt_params, fixed_params)
+    model_params, opt_params_clean, fixed_params_clean = prepare_model_params(initial_opt_params, fixed_params)
+    validated_priors = validate_priors(priors, opt_params_clean, fixed_params_clean)
+    priors_keys = tuple(validated_priors.keys())
+    priors_means = tuple(v[0] for v in validated_priors.values())
+    priors_sigmas = tuple(v[1] for v in validated_priors.values())
  
     ra_model, dec_model, v_model, valid_mask_model, err = forward_model(
         model_params, distance_pc
@@ -1065,12 +1187,10 @@ def evaluate_initial_guess(
  
     prepared_data = extract_streamline.prepare_data(data, uncertainties, n_elements=n_elements)
     chi2_total, loss_trace, _ = chi2_loss(
-        model_params, distance_pc, prepared_data, loss_method=loss_method
+        model_params, distance_pc, prepared_data, loss_method=loss_method,
+        priors_keys=priors_keys, priors_means=priors_means, priors_sigmas=priors_sigmas
     )
     chi2_components = loss_trace['chi2_components']
- 
-    n_valid = int(jnp.sum(valid))
-    n_total = len(valid)
  
     return InitialGuessResult(
         model_params=model_params,
@@ -1094,6 +1214,7 @@ def fit_streamline(initial_opt_params, fixed_params, streamer, distance_pc,
                    early_stopping_patience=50,
                    save_folder='sting_results',
                    loss_method=1, # 0: radecvel, 1: rthetavel
+                   priors=None,
                    v_lsr=None,
                    show_plots=False
                    ):
@@ -1145,6 +1266,10 @@ def fit_streamline(initial_opt_params, fixed_params, streamer, distance_pc,
         - 0: radecvel: optimise RA, Dec, and velocity residuals.
         - 1: rthetavel: optimise projected radial distance, polar angle, and velocity residuals.
         Both options use the same model-data matching and overlap penalty.
+    priors : dict or None
+        Optional Gaussian priors on optimised parameters, in the form
+        {param_name: (mean, sigma), ...}. Only optimised parameters can have priors.
+        Mean and sigma must be in the same canonical units as the rest of the code
     v_lsr : float or None
         Systemic velocity (km/s). When provided, drawn as a reference line on the best-fit
         velocity-radius plot
@@ -1201,6 +1326,12 @@ def fit_streamline(initial_opt_params, fixed_params, streamer, distance_pc,
     # add bounds for angles if they are being optimised
     param_bounds = auto_fill_angle_bounds(opt_params, param_bounds)
 
+    # check priors are valid and match optimised parameters
+    validated_priors = validate_priors(priors, opt_params, fixed_params)
+    priors_keys = tuple(validated_priors.keys())
+    priors_means = tuple(float(v[0]) for v in validated_priors.values())
+    priors_sigmas = tuple(float(v[1]) for v in validated_priors.values())
+
 
     opt_param_keys = list(opt_params.keys())
     data = make_data_tuple_float64(streamer.data)
@@ -1245,6 +1376,9 @@ def fit_streamline(initial_opt_params, fixed_params, streamer, distance_pc,
             prepared_data,
             loss_method=loss_method,
             npoints=npoints,
+            priors_keys=priors_keys,
+            priors_means=priors_means,
+            priors_sigmas=priors_sigmas
         )
         return chi2_total, (loss_trace, err)
 
@@ -1327,6 +1461,10 @@ def fit_streamline(initial_opt_params, fixed_params, streamer, distance_pc,
     print(f"Loss method: {loss_method}")
     print(f"optimising parameters: {opt_param_keys}")
     print(f"Fixed parameters: {list(fixed_params.keys())}")
+    if validated_priors:
+        print(f"Priors:")
+        for key, (mu_p, sigma_p) in validated_priors.items():
+            print(f"  {key}: mean={format_param(key, mu_p)}, sigma={format_param(key, sigma_p)}")
     if loss_threshold is not None:
         print(
             f"Threshold-based stopping enabled: loss <= {loss_threshold:.6g} "
@@ -1394,23 +1532,6 @@ def fit_streamline(initial_opt_params, fixed_params, streamer, distance_pc,
                     continue
                 else:
                     opt_params_norm[key] = jnp.clip(opt_params_norm[key], 0.0, 1.0)
-
-            # Gradient-aware epsilon protection for v_r0 near zero:
-            # When v_r0 is very close to zero, use the sign of the gradient to determine
-            # which direction to protect towards, allowing the optimiser to continue smoothly.
-            # if 'v_r0' in opt_param_keys:
-            #     threshold_norm = to_float64(1e-12)  # normalised space threshold
-            #     v_r0_norm_val = opt_params_norm['v_r0']
-            #     if bool(jnp.all(jnp.abs(v_r0_norm_val) < threshold_norm)):
-            #         # v_r0 is very close to zero; check gradient direction
-            #         grad_v_r0 = norm_grads['v_r0']
-            #         # In gradient descent, we move opposite to gradient:
-            #         protect_sign = -jnp.sign(grad_v_r0)
-            #         # Default to positive if gradient is exactly zero
-            #         protect_sign = jnp.where(protect_sign == 0, 1.0, protect_sign)
-            #         # Set v_r0 to small epsilon in the gradient-indicated direction
-            #         epsilon_norm = threshold_norm
-            #         opt_params_norm['v_r0'] = protect_sign * epsilon_norm
 
             # Now materialize physical parameters from the (possibly clamped)
             # normalised parameters.
@@ -1537,6 +1658,9 @@ def fit_streamline(initial_opt_params, fixed_params, streamer, distance_pc,
             best_norm_opt_params=best_opt_params_norm,
             rotation_key=key_needs_transform,
             npoints=npoints,
+            priors_keys=priors_keys,
+            priors_means=priors_means,
+            priors_sigmas=priors_sigmas
         )
     except Exception as e:
         print(f"\nWarning: parameter uncertainty estimation failed: ({e}).")

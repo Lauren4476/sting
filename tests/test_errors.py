@@ -109,9 +109,18 @@ def _inv_softplus(y):
 def _to_float64_gd(x):
     return jnp.asarray(x, dtype=jnp.float64)
 
+def _compute_prior_penalty(model_params, priors_means, priors_sigmas, priors_keys):
+    penalty = jnp.asarray(0.0, dtype=jnp.float64)
+    for key, mu_p, sigma_p in zip(priors_keys, priors_means, priors_sigmas):
+        mu_p = jnp.asarray(mu_p, dtype=jnp.float64)
+        sigma_p = jnp.asarray(sigma_p, dtype=jnp.float64)
+        penalty = penalty + ((model_params[key] - mu_p) / sigma_p) ** 2
+    return penalty
+
 _gd.softplus = _softplus
 _gd.inv_softplus = _inv_softplus
 _gd.to_float64 = _to_float64_gd
+_gd.compute_prior_penalty = _compute_prior_penalty
 
 # Inject all stubs before importing the module under test
 sys.modules["sting.stream_lines_grad"] = _slg
@@ -712,3 +721,198 @@ class TestModuleConstants:
     def test_streamline_param_keys_contains_core_params(self):
         core = {"r0", "mass", "inc", "pa", "v_r0", "v_lsr", "mu"}
         assert core.issubset(set(errors_module.STREAMLINE_MODEL_PARAM_KEYS))
+
+
+
+# ===========================================================================
+# chi2_loss_hsafe — prior penalty behaviour
+# ===========================================================================
+
+class TestChi2LossHsafePriorPenalty:
+    """Tests that chi2_loss_hsafe correctly adds the Gaussian prior penalty."""
+
+    def _install_xyz_stub(self, n=100):
+        def _xyz_stream(**kwargs):
+            npoints = kwargs.get("npoints", n)
+            # x goes from -0.01 to -1.0 so that ra_model = -x/distance_pc
+            # is INCREASING (small to large), giving a monotone dmetric
+            x = jnp.linspace(-0.01, -1.0, npoints)
+            y = jnp.zeros(npoints)
+            z = jnp.zeros(npoints)
+            valid = jnp.ones(npoints, dtype=bool)
+            return (x, y, z), (jnp.zeros(npoints),) * 3, valid
+        _slg.xyz_stream = _xyz_stream
+
+    def _sort_idx_and_dmetric(self, n=10000, distance_pc=200.0):
+        # x = linspace(-0.01, -1.0, n) → ra_model increasing from 0.00005 to 0.005
+        x = jnp.linspace(-0.01, -1.0, n)
+        ra_model = -x / distance_pc   # increasing: [0.00005, ..., 0.005]
+        # stub arc-length metric: cumsum of diffs, same as _get_distance_metric
+        dr = jnp.sqrt(jnp.diff(ra_model, prepend=ra_model[0])**2)  # dec=0
+        dmetric_frozen = jnp.cumsum(dr)   # matches what the stub returns
+        sort_idx = jnp.arange(n)          # now correctly sorted ascending
+        return sort_idx, dmetric_frozen
+
+    def _make_prepared_data(self, n=10, distance_pc=200.0):
+        from collections import namedtuple
+        # ra_model ranges ~[0.00005, 0.005]; data must be inside that range
+        ra = jnp.array(np.linspace(0.0001, 0.004, n))
+        dec = jnp.zeros(n)
+        v = jnp.ones(n)
+        sigma = jnp.ones(n) * 0.1
+        dmetric, _ = _get_distance_metric(ra, dec)
+        PreparedData = namedtuple(
+            "PreparedData",
+            ["ra_data", "dec_data", "v_data",
+            "ra_sigma_safe", "dec_sigma_safe", "v_sigma_safe",
+            "data_finite_mask", "r_proj_data", "theta_proj_data",
+            "dmetric_data"],
+        )
+        r_proj = jnp.sqrt(ra**2 + dec**2)
+        theta_proj = jnp.arctan2(dec, ra)
+        return PreparedData(
+            ra_data=ra, dec_data=dec, v_data=v,
+            ra_sigma_safe=sigma, dec_sigma_safe=sigma, v_sigma_safe=sigma,
+            data_finite_mask=jnp.ones(n, dtype=bool),
+            r_proj_data=r_proj, theta_proj_data=theta_proj,
+            dmetric_data=dmetric,
+        )
+    
+    def _base_params(self):
+        return {
+            "r0": 100.0, "theta0": 0.3, "phi0": 0.1,
+            "mu": 0.5, "v_r0": 2.0, "mass": 1.0,
+            "inc": 0.2, "pa": 0.1, "rmin": 0.0,
+            "deltar": 50.0, "v_lsr": 0.0,
+        }
+
+    def test_no_priors_gives_same_result_as_with_empty_tuples(self):
+        """Explicit empty tuples and default (no prior kwargs) should be identical."""
+        self._install_xyz_stub()
+        prepared = self._make_prepared_data()
+        params = self._base_params()
+        sort_idx, dmetric_frozen = self._sort_idx_and_dmetric()
+
+        chi2_no_prior = chi2_loss_hsafe(
+            params, 200.0, prepared, 0, sort_idx, dmetric_frozen,
+        )
+        chi2_empty = chi2_loss_hsafe(
+            params, 200.0, prepared, 0, sort_idx, dmetric_frozen,
+            priors_keys=(), priors_means=(), priors_sigmas=(),
+        )
+        assert float(chi2_no_prior) == float(chi2_empty)
+
+    def test_prior_at_exact_param_value_does_not_change_loss(self):
+        """A prior whose mean equals the current parameter value adds zero penalty."""
+        self._install_xyz_stub()
+        prepared = self._make_prepared_data()
+        params = self._base_params()
+        sort_idx, dmetric_frozen = self._sort_idx_and_dmetric()
+
+        chi2_base = float(chi2_loss_hsafe(
+            params, 200.0, prepared, 0, sort_idx, dmetric_frozen,
+        ))
+        chi2_with_prior = float(chi2_loss_hsafe(
+            params, 200.0, prepared, 0, sort_idx, dmetric_frozen,
+            priors_keys=("mass",),
+            priors_means=(1.0,),    # mass is 1.0 in params
+            priors_sigmas=(0.1,),
+        ))
+        assert pytest.approx(chi2_with_prior, rel=1e-9) == chi2_base
+
+    def test_prior_one_sigma_away_adds_one_to_loss(self):
+        """A single prior with the parameter 1 sigma from the mean adds exactly 1."""
+        self._install_xyz_stub()
+        prepared = self._make_prepared_data()
+        params = self._base_params()  # mass = 1.0
+        sort_idx, dmetric_frozen = self._sort_idx_and_dmetric()
+
+        chi2_base = float(chi2_loss_hsafe(
+            params, 200.0, prepared, 0, sort_idx, dmetric_frozen,
+        ))
+        chi2_with_prior = float(chi2_loss_hsafe(
+            params, 200.0, prepared, 0, sort_idx, dmetric_frozen,
+            priors_keys=("mass",),
+            priors_means=(0.9,),    # mass=1.0, mean=0.9, sigma=0.1 → 1 sigma away
+            priors_sigmas=(0.1,),
+        ))
+        assert pytest.approx(chi2_with_prior - chi2_base, rel=1e-6) == 1.0
+
+    def test_prior_two_sigma_away_adds_four_to_loss(self):
+        """A single prior with the parameter 2 sigma from the mean adds exactly 4."""
+        self._install_xyz_stub()
+        prepared = self._make_prepared_data()
+        params = self._base_params()  # mass = 1.0
+        sort_idx, dmetric_frozen = self._sort_idx_and_dmetric()
+
+        chi2_base = float(chi2_loss_hsafe(
+            params, 200.0, prepared, 0, sort_idx, dmetric_frozen,
+        ))
+        chi2_with_prior = float(chi2_loss_hsafe(
+            params, 200.0, prepared, 0, sort_idx, dmetric_frozen,
+            priors_keys=("mass",),
+            priors_means=(0.8,),    # mass=1.0, mean=0.8, sigma=0.1 → 2 sigma away
+            priors_sigmas=(0.1,),
+        ))
+        assert pytest.approx(chi2_with_prior - chi2_base, rel=1e-6) == 4.0
+
+    def test_two_priors_penalties_sum_correctly(self):
+        """Two independent 1-sigma deviations should together add exactly 2."""
+        self._install_xyz_stub()
+        prepared = self._make_prepared_data()
+        params = self._base_params()  # mass=1.0, inc=0.2
+        sort_idx, dmetric_frozen = self._sort_idx_and_dmetric()
+
+        chi2_base = float(chi2_loss_hsafe(
+            params, 200.0, prepared, 0, sort_idx, dmetric_frozen,
+        ))
+        chi2_with_priors = float(chi2_loss_hsafe(
+            params, 200.0, prepared, 0, sort_idx, dmetric_frozen,
+            priors_keys=("mass", "inc"),
+            priors_means=(0.9, 0.1),   # mass: 1 sigma away; inc: 1 sigma away
+            priors_sigmas=(0.1, 0.1),
+        ))
+        assert pytest.approx(chi2_with_priors - chi2_base, rel=1e-6) == 2.0
+
+    def test_prior_increases_loss_when_parameter_off_mean(self):
+        """A prior whose mean differs from the parameter value must increase the loss."""
+        self._install_xyz_stub()
+        prepared = self._make_prepared_data()
+        params = self._base_params()
+        sort_idx, dmetric_frozen = self._sort_idx_and_dmetric()
+
+        chi2_base = float(chi2_loss_hsafe(
+            params, 200.0, prepared, 0, sort_idx, dmetric_frozen,
+        ))
+        chi2_with_prior = float(chi2_loss_hsafe(
+            params, 200.0, prepared, 0, sort_idx, dmetric_frozen,
+            priors_keys=("mass",),
+            priors_means=(2.0,),    # very far from mass=1.0
+            priors_sigmas=(0.1,),
+        ))
+        assert chi2_with_prior > chi2_base
+
+    def test_prior_consistent_across_loss_methods(self):
+        """The prior penalty should be identical for method 0 and method 1."""
+        self._install_xyz_stub()
+        prepared = self._make_prepared_data()
+        params = self._base_params()
+        sort_idx, dmetric_frozen = self._sort_idx_and_dmetric()
+
+        chi2_m0_base = float(chi2_loss_hsafe(
+            params, 200.0, prepared, 0, sort_idx, dmetric_frozen,
+        ))
+        chi2_m1_base = float(chi2_loss_hsafe(
+            params, 200.0, prepared, 1, sort_idx, dmetric_frozen,
+        ))
+        chi2_m0_prior = float(chi2_loss_hsafe(
+            params, 200.0, prepared, 0, sort_idx, dmetric_frozen,
+            priors_keys=("mass",), priors_means=(0.9,), priors_sigmas=(0.1,),
+        ))
+        chi2_m1_prior = float(chi2_loss_hsafe(
+            params, 200.0, prepared, 1, sort_idx, dmetric_frozen,
+            priors_keys=("mass",), priors_means=(0.9,), priors_sigmas=(0.1,),
+        ))
+        # The increment from the prior should be the same regardless of loss method
+        assert pytest.approx(chi2_m0_prior - chi2_m0_base, rel=1e-6) == \
+               pytest.approx(chi2_m1_prior - chi2_m1_base, rel=1e-6)

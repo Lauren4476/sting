@@ -1460,13 +1460,20 @@ def plot_streamline_covariance_samples(best_opt_params,
         gradient_tol=gradient_tol
     )
 
+    print("=== COVARIANCE DIAGNOSIS ===")
+    print("mu_opt_keys:", mu_opt_keys)
+    print("best_for_cov_mu:", best_for_cov_mu)
+    print("Diagonal of cov (variances):", np.diag(np.asarray(cov)))
+    print("1-sigma errors from cov diagonal:", np.sqrt(np.abs(np.diag(np.asarray(cov)))))
+    print("param_errors:", param_errors)
+
     _, streamline_samples = generate_streamline_samples(
-        best_opt_params=best_for_cov_mu,   # was: best_for_cov (omega-space) ← Bug 2
+        best_opt_params=best_for_cov_mu,   
         covariance=cov,
-        opt_keys=mu_opt_keys,              # was: opt_keys (omega-space keys) ← Bug 2
-        fixed_params=fixed_params_mu,      # was: fixed_params (still had omega) ← Bug 1
+        opt_keys=mu_opt_keys,              
+        fixed_params=fixed_params_mu,      
         distance=distance,
-        param_bounds=None,                 # bounds already in mu-space; clipping optional
+        param_bounds=None,                 
         n_samples=n_samples
     )
 
@@ -1582,6 +1589,8 @@ def evaluate_streamlines_samples(param_samples, opt_keys, fixed_params, distance
             key: float(value)
             for key, value in zip(opt_keys, sample)
         }
+        if len(streamlines) == 0:
+            print(f"sample_params: {sample_params}")
         sample_params_full, _, _ = gradient_descent.prepare_model_params(sample_params, fixed_params)
         ra, dec, vel, valid_mask, err = gradient_descent.forward_model(sample_params_full, distance)
         ra = np.asarray(ra, dtype=float)
@@ -1631,6 +1640,11 @@ def sample_parameter_sets_from_covariance(best_params, covariance, opt_keys, par
         if key in param_bounds:
             low, high = param_bounds[key]
             samples[:, j] = np.clip(samples[:, j], low, high)
+
+    print("=== SAMPLING DIAGNOSIS ===")
+    print("mean (mu):", mu)
+    print("sample[0]:", samples[0])
+    print("sample[0] - mean:", samples[0] - mu)
 
     return samples
 
