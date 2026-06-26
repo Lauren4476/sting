@@ -1,0 +1,2 @@
+# Tells GitHub explicityly that .fits files are binary, so it doesn't misidentify them as text and mangle them
+*.fits binary
