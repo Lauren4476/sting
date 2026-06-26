@@ -9,6 +9,12 @@ from astropy.coordinates import SkyCoord, FK5
 from collections import namedtuple
 import jax.numpy as jnp
 import jax
+import warnings
+from astropy.wcs import FITSFixedWarning
+from spectral_cube.utils import PossiblySlowWarning
+warnings.filterwarnings('ignore', category=FITSFixedWarning)
+warnings.filterwarnings('ignore', category=PossiblySlowWarning)
+warnings.filterwarnings('ignore', module='spectral_cube.*')
 
 BIG = 1e30
 
@@ -115,7 +121,6 @@ def reduce_to_1D(streamer_cube, yso_centre, n_elements=10):
         - data         : (ra_data, dec_data, v_data) tuple
         - uncertainties: (ra_sigma, dec_sigma, v_sigma) tuple
     '''
-    print('Starting reduction')
     nz, ny, nx = streamer_cube.shape
     yso_centre_icrs = yso_centre.icrs
 

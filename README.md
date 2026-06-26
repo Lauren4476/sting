@@ -196,7 +196,31 @@ The preprocessing steps I use and recommend to isolate a **pure streamer cube** 
 
 ## Contributing / Issues
 
-Bug reports are welcome via the [GitHub issue tracker](https://github.com/Lauren4476/sting/issues). If you have any questions about STING or ideas for additions in future releasees, feel free to get in touch at [lmason@mpe.mpg.de](mailto:lmason@mpe.mpg.de)!
+Contributions of all kinds are very welcome! Here's how to do it.
+
+### Reporting bugs and getting support
+
+Reports of bugs or unexpected behaviour are welcome via opening an Issue on the [GitHub issue tracker](https://github.com/Lauren4476/sting/issues). To help diagnose the problem, please include:
+- a short description of the problem and what you expected to happen instead
+- a code example that reproduces the issue
+- the versions of STING and its dependencies (listed above) you are using
+
+For general questions about how to use STING, open an Issue with the label `question`. You can also get in touch directly at [lmason@mpe.mpg.de](mailto:lmason@mpe.mpg.de).
+
+
+### Contributing code
+
+Bug fixes and contributions of new features are very welcome. To contribute code:
+- fork the repository on GitHub, and create a branch for your change
+- install STING in development mode:
+```pip install -e ".[dev]"```
+- make your changes, and add or update the tests as needed
+- run the test suite to check nothing is broken: ```pytest```
+- open a [pull request](https://github.com/Lauren4476/sting/pulls) against the `main` branch with a description of what your change does and why
+
+If you have an idea for a feature but are unsure how to approach it, feel free to open an Issue to discuss it first!
+
+All contributors who submit an accepted pull request will be listed in the repository's Contributor list on GitHub.
 
 ### Known issues
 
@@ -205,7 +229,7 @@ Bug reports are welcome via the [GitHub issue tracker](https://github.com/Lauren
 
 ## Citing STING
 
-tbc
+tbc, get in touch at [lmason@mpe.mpg.de](mailto:lmason@mpe.mpg.de)
 
 ## Credits
 
