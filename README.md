@@ -2,6 +2,7 @@
 
 ## **ST**reamer **IN**fall with **G**radients
 
+[![PyPI version](https://img.shields.io/pypi/v/sting.svg)](https://pypi.org/project/sting/)
 [![codecov](https://codecov.io/gh/Lauren4476/sting/graph/badge.svg?token=QABJ72IB52)](https://codecov.io/gh/Lauren4476/sting)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://github.com/Lauren4476/sting/blob/main/LICENCE)
 [![Python 3.12](https://img.shields.io/badge/python-3.12-blue.svg)](https://github.com/Lauren4476/sting)
