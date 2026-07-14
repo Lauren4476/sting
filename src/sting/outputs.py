@@ -910,7 +910,7 @@ def plot_dec_vel(
 
     # point cloud (DEC vs velocity)
     if pc_coords is not None:
-        # pc_coords layout: [ra, dec, velocity]
+        # pc_coords layout: [ra, dec, velocity, intensity]
         ax.scatter(pc_coords[1], pc_coords[2], s=1, alpha=0.3, color='grey', label='Point cloud')
 
     # data
@@ -954,6 +954,7 @@ def build_velocity_radius_kde(
     ra_data,
     dec_data,
     vlos_data,
+    intensity_data=None,
     xmin=None,
     xmax=None,
     ymin=None,
@@ -982,16 +983,25 @@ def build_velocity_radius_kde(
         Dictionary with keys: "xx", "yy", "zz", "levels", "xlim", "ylim".
     """
     from scipy import stats
-    ra = np.asarray(ra_data)
-    dec = np.asarray(dec_data)
+    ra = np.asarray(ra_data, dtype=float)
+    dec = np.asarray(dec_data, dtype=float)
     rproj = np.sqrt(ra**2 + dec**2)
     vlos = np.asarray(vlos_data, dtype=float)
-    finite = np.isfinite(rproj) & np.isfinite(vlos)
+
+    if intensity_data is not None:
+        weights = np.asarray(intensity_data, dtype=float)
+        finite = np.isfinite(rproj) & np.isfinite(vlos) & np.isfinite(weights) & (weights > 0)
+    else:
+        weights = None
+        finite = np.isfinite(rproj) & np.isfinite(vlos)
+
     if np.sum(finite) < 3:
         raise ValueError("Need at least 3 finite samples to build KDE background.")
 
     rproj = rproj[finite]
     vlos = vlos[finite]
+    if weights is not None:
+        weights = weights[finite]
 
     if xmin is None:
         xmin = float(np.nanmin(rproj) - 1)
@@ -1007,7 +1017,7 @@ def build_velocity_radius_kde(
     positions = np.vstack([xx.ravel(), yy.ravel()])
     values = np.vstack([rproj, vlos])
 
-    kernel = stats.gaussian_kde(values)
+    kernel = stats.gaussian_kde(values, weights=weights)
     zz = np.reshape(kernel(positions).T, xx.shape)
     zmax = np.nanmax(zz)
     if np.isfinite(zmax) and zmax > 0:
@@ -1017,7 +1027,6 @@ def build_velocity_radius_kde(
         sigma_levels = np.arange(1.0, 2.1, 0.5)
     sigma_levels = np.asarray(sigma_levels, dtype=float)
     levels = np.append(np.exp(-0.5 * sigma_levels**2)[::-1], [1.0])
-    kde_levels = np.append(np.exp(-0.5 * np.arange(1.0, 2.1, 0.5)**2)[::-1], [1.0])
 
     return {
         "xx": xx,
@@ -1083,9 +1092,10 @@ def plot_vel_radius(
     if kde_background is None and pc_coords is not None:
         # make the kde background
         kde_background = build_velocity_radius_kde(
-            ra_data=ra_data,
-            dec_data=dec_data,
-            vlos_data=v_data,
+            ra_data=pc_coords[0],
+            dec_data=pc_coords[1],
+            vlos_data=pc_coords[2],
+            intensity_data=pc_coords[3],
         )
 
     if kde_background is not None:
@@ -1266,10 +1276,12 @@ def plot_vel_radius_by_epoch(
 
     kde_background = None
     if streamer is not None:
+        pc_coords = streamer.pc_coords
         kde_background = build_velocity_radius_kde(
-            ra_data=streamer.ra_data,
-            dec_data=streamer.dec_data,
-            vlos_data=streamer.v_data,
+            ra_data=pc_coords[0],
+            dec_data=pc_coords[1],
+            vlos_data=pc_coords[2],
+            intensity_data=pc_coords[3],
             grid_size=grid_size,
             sigma_levels=levels,
         )

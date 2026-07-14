@@ -111,7 +111,7 @@ def reduce_to_1D(streamer_cube, yso_centre, n_elements=10):
     -------
     StreamerData
         Named tuple with fields:
-        - pc_coords    : full point cloud array, shape (3, N)
+        - pc_coords    : full point cloud array, shape (4, N)
         - ra_data      : RA offsets of bin means (arcsec), shape (n_elements,)
         - dec_data     : Dec offsets of bin means (arcsec), shape (n_elements,)
         - v_data       : velocities of bin means (km/s), shape (n_elements,)
@@ -156,29 +156,30 @@ def reduce_to_1D(streamer_cube, yso_centre, n_elements=10):
     pc_ra = ra_coords[pc_y, pc_x]
     pc_dec = dec_coords[pc_y, pc_x]
     pc_v = v_coords[pc_z]
-    pc_coords = np.array([pc_ra, pc_dec, pc_v]) # shape (3, n_points)   
+    pc_coords = np.array([pc_ra, pc_dec, pc_v, flux]) # shape (4, n_points): ra, dec, v, intensity  
 
     # compute partitions for binning the point cloud
     distance_metric, _ = get_distance_metric(pc_coords[0], pc_coords[1], n_elements=n_elements)
     b_per = np.linspace(0, 100, n_elements+1) # percentiles to bin the pc into
     partitions = np.array([np.percentile(distance_metric, per) for per in b_per])
 
-    # flux-weighted means and stds in each bin
+    # flux-weighted means and stds in each bin (ra, dec, v only -- intensity is not binned)
+    pc_ra_dec_v = pc_coords[:3]
     pc_means = np.zeros((3, n_elements))
     pc_stds = np.zeros((3, n_elements))
     for i in range(n_elements):
         distance_indices = (distance_metric > partitions[i]) & (distance_metric <= partitions[i+1])
-        pc_means[:, i] = np.average(pc_coords.T[distance_indices],
+        pc_means[:, i] = np.average(pc_ra_dec_v.T[distance_indices],
                                  axis=0,
                                  weights=flux[distance_indices])
-        pc_stds[:, i] = np.sqrt(np.average((pc_coords.T[distance_indices] - pc_means[:, i])**2,
+        pc_stds[:, i] = np.sqrt(np.average((pc_ra_dec_v.T[distance_indices] - pc_means[:, i])**2,
                                          axis=0,
                                          weights=flux[distance_indices]))
         
     # flip arrays so that they go from large to small distance (towards star)
     pc_means = pc_means[:, ::-1]
     pc_stds = pc_stds[:, ::-1]
-
+ 
     ra_data, dec_data, v_data = pc_means
     ra_sigma, dec_sigma, v_sigma = pc_stds
     
@@ -300,7 +301,7 @@ def get_metric_partitions(pc_coords, n_elements):
     Parameters
     ----------
     pc_coords : array
-        Point cloud coordinates. Index 0 = RA, Index 1 = Dec, Index 2 = velocity
+        Point cloud coordinates. Index 0 = RA, Index 1 = Dec, Index 2 = velocity, Index 3 = intensity
     n_elements : int
         Number of partitions required
 
