@@ -20,6 +20,15 @@ import os
 from . import gradient_descent
 from . import extract_streamline
 
+# Colours
+BASIC      = "#000000"
+STING      = "#00A2FF"
+STING2     = "#1154FE"
+BY_EYE     = "#FEAE00"
+DATA       = "#000000"
+POINTCLOUD = "#7F7F7F"
+STAR       = "#FFEE00"
+
 def param_for_display(key, value):
     """
     Format parameter for display in output, with units. Notably:
@@ -306,7 +315,7 @@ def plot_loss(loss_history, save_folder='sting_results', show=False):
     # loss_history is 0-indexed: loss_history[i] = loss at epoch i
     plt.figure(figsize=(12, 3))
     epochs = range(len(loss_history))
-    plt.plot(epochs, loss_history)
+    plt.plot(epochs, loss_history, color=BASIC)
     plt.xlabel('Epoch')
     plt.ylabel('Loss')
     plt.title('Optimisation Progress')
@@ -335,10 +344,10 @@ def make_morphology_background(pc_coords, metric_boundaries, ra_lim, dec_lim, fi
     """
     fig, ax = plt.subplots(figsize=figsize)
     pc_coords_np = np.asarray(pc_coords, dtype=float)
-    ax.scatter(pc_coords_np[0], pc_coords_np[1], s=1, color='gray', alpha=0.3)
+    ax.scatter(pc_coords_np[0], pc_coords_np[1], s=1, color=POINTCLOUD, alpha=0.3)
     if metric_boundaries is not None:
         extract_streamline.plot_metric_boundaries(ax, pc_coords_np, metric_boundaries,
-                                                  color='gray', linewidth=1, alpha=0.3)
+                                                  color=POINTCLOUD, linewidth=1, alpha=0.3)
     ax.set_xlim(ra_lim)
     ax.set_ylim(dec_lim)
     ax.axis('off')
@@ -511,13 +520,13 @@ def plot_morphology(
         )
     elif pc_coords is not None:
         pc_coords_np = np.asarray(pc_coords, dtype=float)
-        ax.scatter(pc_coords_np[0], pc_coords_np[1], s=1, color='gray',
+        ax.scatter(pc_coords_np[0], pc_coords_np[1], s=1, color=POINTCLOUD,
                    alpha=0.3, label='Point cloud', zorder=4)
         if metric_boundaries is not None:
             ax_limits = ax.get_xlim(), ax.get_ylim()
             extract_streamline.plot_metric_boundaries(
                 ax, pc_coords_np, metric_boundaries,
-                color='gray', linewidth=1, alpha=0.3,
+                color=POINTCLOUD, linewidth=1, alpha=0.3,
             )
             ax.set_xlim(ax_limits[0])
             ax.set_ylim(ax_limits[1])
@@ -525,7 +534,7 @@ def plot_morphology(
 
     # model curve if given
     if ra_model is not None and dec_model is not None:
-        ax.plot(ra_model, dec_model, color='blue', linewidth=2, label='STING', zorder=7)
+        ax.plot(ra_model, dec_model, color=STING, linewidth=2.5, label='STING', zorder=8)
 
     # model points if given
     if ra_model_interp is not None and dec_model_interp is not None and valid is not None:
@@ -533,9 +542,9 @@ def plot_morphology(
             ax.scatter(
                 ra_model_interp[valid],
                 dec_model_interp[valid],
-                s=25,
-                color='blue',
-                zorder=7,
+                s=35,
+                color=STING,
+                zorder=8,
             )
 
     # by eye model if given
@@ -544,10 +553,10 @@ def plot_morphology(
         ax.plot(
             np.asarray(ra_by_eye, dtype=float),
             np.asarray(dec_by_eye, dtype=float),
-            color='tab:green',
-            linewidth=2,
+            color=BY_EYE,
+            linewidth=2.5,
             label='By-eye',
-            zorder=8,
+            zorder=7,
         )
 
     # data points streamline if given
@@ -558,10 +567,12 @@ def plot_morphology(
                 dec_data,
                 xerr=ra_sigma,
                 yerr=dec_sigma,
-                fmt='o-',
+                fmt='s-',
                 label='Extracted 1D Streamline',
-                color='red',
+                color=DATA,
                 zorder=5,
+                elinewidth=1.4,
+                capsize=3
             )
         else:
             ax.plot(
@@ -569,13 +580,13 @@ def plot_morphology(
                 dec_data,
                 'o-',
                 label='Extracted 1D Streamline',
-                color='red',
+                color=DATA,
                 zorder=5,
             )
 
     star_ra = 0
     star_dec = 0
-    ax.scatter(star_ra, star_dec, marker='*', s=100, color='yellow', edgecolor='black', zorder=10)
+    ax.scatter(star_ra, star_dec, marker='*', s=100, color=STAR, edgecolor='black', zorder=10)
     ax.set_xlabel('RA Offset (arcsec)')
     ax.set_ylabel('Dec Offset (arcsec)')
 
@@ -739,22 +750,22 @@ def plot_ra_vel(
 
     # point cloud (RA vs velocity)
     if pc_coords is not None:
-        ax.scatter(pc_coords[0], pc_coords[2], s=1, alpha=0.3, color='grey', label='Point cloud')
+        ax.scatter(pc_coords[0], pc_coords[2], s=1, alpha=0.3, color=POINTCLOUD, label='Point cloud')
 
     # data
     if ra_data is not None and v_data is not None:
         if ra_sigma is not None and v_sigma is not None:
-            ax.errorbar(ra_data, v_data, xerr=ra_sigma, yerr=v_sigma, fmt='o', color='red', ecolor='red', ms=4, alpha=0.9, label='Data')
+            ax.errorbar(ra_data, v_data, xerr=ra_sigma, yerr=v_sigma, fmt='s-', color=DATA, ecolor=DATA, ms=4, alpha=0.9, label='Data', elinewidth=1.4, capsize=3)
         else:
-            ax.plot(ra_data, v_data, 'o', color='red', label='Data')
+            ax.plot(ra_data, v_data, 's-', color=DATA, label='Data')
 
     # model curve
     if ra_model is not None and v_model is not None:
-        ax.plot(ra_model, v_model, color='blue', linewidth=2, label='Model Streamline', zorder=7)
+        ax.plot(ra_model, v_model, color=STING, linewidth=2.5, label='Model Streamline', zorder=7)
 
     # interpolated points
     if ra_model_interp is not None and v_model_interp is not None and valid is not None:
-        ax.scatter(np.asarray(ra_model_interp)[valid], np.asarray(v_model_interp)[valid], s=25, color='blue', zorder=5, label='Model at data positions')
+        ax.scatter(np.asarray(ra_model_interp)[valid], np.asarray(v_model_interp)[valid], s=30, color=STING, zorder=5, label='Model at data positions')
 
     ax.set_xlabel("RA Offset (arcsec)")
     ax.set_ylabel("Velocity (km/s)")
@@ -911,22 +922,22 @@ def plot_dec_vel(
     # point cloud (DEC vs velocity)
     if pc_coords is not None:
         # pc_coords layout: [ra, dec, velocity, intensity]
-        ax.scatter(pc_coords[1], pc_coords[2], s=1, alpha=0.3, color='grey', label='Point cloud')
+        ax.scatter(pc_coords[1], pc_coords[2], s=1, alpha=0.3, color=POINTCLOUD, label='Point cloud')
 
     # data
     if dec_data is not None and v_data is not None:
         if dec_sigma is not None and v_sigma is not None:
-            ax.errorbar(dec_data, v_data, xerr=dec_sigma, yerr=v_sigma, fmt='o', color='red', ecolor='red', ms=4, alpha=0.9, label='Data')
+            ax.errorbar(dec_data, v_data, xerr=dec_sigma, yerr=v_sigma, fmt='s-', color=DATA, ecolor=DATA, ms=4, alpha=0.9, label='Data', elinewidth=1.4, capsize=3)
         else:
-            ax.plot(dec_data, v_data, 'o', color='red', label='Data')
+            ax.plot(dec_data, v_data, 's-', color=DATA, label='Data')
 
     # model curve
     if dec_model is not None and v_model is not None:
-        ax.plot(dec_model, v_model, color='blue', linewidth=2, label='Model Streamline')
+        ax.plot(dec_model, v_model, color=STING, linewidth=2.5, label='Model Streamline')
 
     # interpolated points
     if dec_model_interp is not None and v_model_interp is not None and valid is not None:
-        ax.scatter(np.asarray(dec_model_interp)[valid], np.asarray(v_model_interp)[valid], s=25, color='blue', zorder=5, label='Model at data positions')
+        ax.scatter(np.asarray(dec_model_interp)[valid], np.asarray(v_model_interp)[valid], s=30, color=STING, zorder=5, label='Model at data positions')
 
     ax.set_xlabel("DEC Offset (arcsec)")
     ax.set_ylabel("Velocity (km/s)")
@@ -1004,13 +1015,13 @@ def build_velocity_radius_kde(
         weights = weights[finite]
 
     if xmin is None:
-        xmin = float(np.nanmin(rproj) - 1)
+        xmin = float(np.nanmin(rproj) - 0.5)
     if xmax is None:
-        xmax = float(np.nanmax(rproj) + 1)
+        xmax = float(np.nanmax(rproj) + 0.5)
     if ymin is None:
-        ymin = float(np.nanmin(vlos) - 1)
+        ymin = float(np.nanmin(vlos) - 0.5)
     if ymax is None:
-        ymax = float(np.nanmax(vlos) + 1)
+        ymax = float(np.nanmax(vlos) + 0.5)
 
 
     xx, yy = np.mgrid[xmin:xmax:complex(grid_size), ymin:ymax:complex(grid_size)]
@@ -1123,7 +1134,7 @@ def plot_vel_radius(
             float(velocity_reference),
             marker='*',
             s=100,
-            color='yellow',
+            color=STAR,
             edgecolor='black',
             zorder=10,
             label='Central Source',
@@ -1146,20 +1157,22 @@ def plot_vel_radius(
                 v_data,
                 xerr=rproj_sigma,
                 yerr=v_sigma,
-                fmt='o',
-                color='red',
-                ecolor='red',
+                fmt='s-',
+                color=DATA,
+                ecolor=DATA,
                 ms=4,
                 alpha=0.9,
                 label='Extracted 1D Streamline',
                 zorder=6,
+                elinewidth=1.4,
+                capsize=3
             )
         else:
             data_handle = ax.plot(
                 rproj_data,
                 v_data,
-                'o',
-                color='red',
+                's-',
+                color=DATA,
                 label='Extracted 1D Streamline',
                 zorder=6,
             )[0]
@@ -1167,10 +1180,10 @@ def plot_vel_radius(
     model_handle, = ax.plot(
         rproj_model[order_model],
         v_model[order_model],
-        color='blue',
-        linewidth=2,
+        color=STING,
+        linewidth=2.5,
         label='STING',
-        zorder=7,
+        zorder=8,
     )
 
     if (
@@ -1187,8 +1200,8 @@ def plot_vel_radius(
         ax.scatter(
             rproj_interp[valid],
             v_model_interp[valid],
-            s=25,
-            color='blue',
+            s=35,
+            color=STING,
             label='Model at retained data arc lengths',
             zorder=8,
         )
@@ -1196,7 +1209,7 @@ def plot_vel_radius(
     if velocity_reference is not None:
         ax.axhline(
             float(velocity_reference),
-            color='black',
+            color=BASIC,
             linestyle='--',
             label='Systemic Velocity',
             zorder=4,
@@ -1211,10 +1224,10 @@ def plot_vel_radius(
         by_eye_handle, = ax.plot(
             rproj_by_eye,
             v_by_eye,
-            color='tab:green',
-            linewidth=2,
+            color=BY_EYE,
+            linewidth=2.5,
             label='By-eye',
-            zorder=9,
+            zorder=7,
         )
 
     ax.set_xlabel('Projected Distance from Source (arcsec)')
@@ -1381,7 +1394,7 @@ def plot_param_uncertainties(opt_keys, opt_params, opt_sigmas, save_folder=None,
     ax.barh(
         ypos,
         norm_errs,
-        color='tab:blue',
+        color=STING,
         alpha=0.8
     )
     ax.set_yticks(ypos)
@@ -1511,8 +1524,8 @@ def plot_streamline_covariance_samples(best_opt_params,
 
         rproj = np.sqrt(ra**2 + dec**2)
         order = np.argsort(rproj)
-        ax_sky.plot(ra, dec, color='tab:blue', alpha=0.1, lw=1)
-        ax_v.plot(rproj[order], vel[order], color='tab:blue', alpha=0.1, lw=1)
+        ax_sky.plot(ra, dec, color=STING, alpha=0.15, lw=1)
+        ax_v.plot(rproj[order], vel[order], color=STING, alpha=0.15, lw=1)
 
     # plot best fit streamline
     best_opt_full_params, best_opt_params, fixed_params = gradient_descent.prepare_model_params(best_opt_params, fixed_params)
@@ -1526,13 +1539,13 @@ def plot_streamline_covariance_samples(best_opt_params,
     v_best = v_best[valid_mask_best]
     rproj_best = np.sqrt(ra_best**2 + dec_best**2)
     order_best = np.argsort(rproj_best)
-    ax_sky.plot(ra_best, dec_best, color='blue', lw=2, label='Best-fit')
-    ax_v.plot(rproj_best[order_best], v_best[order_best], color='blue', lw=2, label='Best-fit')
+    ax_sky.plot(ra_best, dec_best, color=STING2, lw=2.5, label='STING Best-fit')
+    ax_v.plot(rproj_best[order_best], v_best[order_best], color=STING2, lw=2.5, label='STING Best-fit')
 
     # plot data
     ax_sky.errorbar(
         ra_data, dec_data, xerr=ra_sigma, yerr=dec_sigma,
-        fmt='o', color='red', ecolor='red', ms=4, alpha=0.9, label='Data'
+        fmt='s-', color=DATA, ecolor=DATA, ms=4, alpha=0.9, label='Data', elinewidth=1.4, capsize=3
         )
     rproj_data = np.sqrt(ra_data**2 + dec_data**2)
     # get errors in rproj_data
@@ -1540,12 +1553,17 @@ def plot_streamline_covariance_samples(best_opt_params,
     order_data = np.argsort(rproj_data)
     ax_v.errorbar(
         rproj_data[order_data], np.asarray(v_data)[order_data], yerr=np.asarray(v_sigma)[order_data], xerr=np.asarray(rproj_sigma)[order_data],
-        fmt='o', color='red', ecolor='red', ms=4, alpha=0.9, label='Data'
+        fmt='s-', color=DATA, ecolor=DATA, ms=4, alpha=0.9, label='Data', elinewidth=1.4, capsize=3
         )
     if v_lsr is not None:
         xmin, xmax = ax_v.get_xlim()
         ax_v.hlines(v_lsr, xmin=xmin, xmax=xmax, colors='k', linestyles='--', alpha=0.6,)
         ax_v.set_xlim(xmin, xmax)
+
+    # plot star
+    ax_sky.scatter(0, 0, marker='*', s=100, color=STAR, edgecolor='black', zorder=10)
+    if v_lsr is not None:
+        ax_v.scatter(0, v_lsr, marker='*', s=100, color=STAR, edgecolor='black', zorder=10)
 
     # finalise plots
     ax_sky.invert_xaxis()
@@ -1685,7 +1703,7 @@ def plot_param_optimisation_history(save_folder='sting_results'):
 
     for ax, param in zip(axes[1:], param_names):
         values = optimisation_log[param].values
-        ax.plot(epochs, values)
+        ax.plot(epochs, values, color=STING)
         ax.set_ylabel(param)
         ax.grid(True)
 
