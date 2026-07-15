@@ -1013,7 +1013,7 @@ def build_velocity_radius_kde(
     vlos = vlos[finite]
     if weights is not None:
         weights = weights[finite]
-
+    weights=None
     if xmin is None:
         xmin = float(np.nanmin(rproj) - 0.5)
     if xmax is None:

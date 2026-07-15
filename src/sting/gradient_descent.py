@@ -743,7 +743,7 @@ def gradient_l2_norm(grad_tree):
     return jnp.sqrt(grad_sum_sq)
 
 @jax.jit(static_argnames=("npoints",))
-def forward_model(model_params, distance_pc, npoints=10000):
+def forward_model(model_params, distance_pc, npoints=1e6):
     """
     Run the forward model using stream_lines_grad.checked_xyz_stream
     
@@ -963,7 +963,7 @@ def chi2_loss(
     distance_pc,
     prepared_data,
     loss_method=0,
-    npoints=10000,
+    npoints=1e6,
     priors_keys=(),
     priors_means=(),
     priors_sigmas=()
@@ -1393,9 +1393,9 @@ def fit_streamline(initial_opt_params, fixed_params, streamer, distance_pc,
     if 'r0' in param_bounds:
         max_r0 = param_bounds['r0'][1]
         deltar = fixed_params['deltar'] if 'deltar' in fixed_params else 1.0
-        npoints = int(jnp.ceil(max_r0 / deltar))
+        npoints = int(jnp.ceil(max_r0 / deltar)) + 1
     else: 
-        npoints = 50000
+        npoints = 1e10
 
     fixed_params_for_core = fixed_params
 
