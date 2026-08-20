@@ -94,11 +94,10 @@ def build_stream_quantities(mass, r0, theta0, mu, v_r0):
     store in class StreamState (near top)
     '''
     # Protect near-zero v_r0 from creating singularities in nu calculation
-    # Allow negative v_r0, but replace exact-zero or tiny values with signed epsilon
     threshold = to_float64(eps)
     v_r0 = jnp.where(
         jnp.isclose(v_r0, to_float64(0.0)),
-        - jnp.sign(v_r0) * threshold, #let it continue in the direction it was going
+        jnp.sign(v_r0) * threshold, #let it continue in the direction it was going
         v_r0  # normal values -> unchanged
         )
     threshold = to_float64(eps)
@@ -336,14 +335,18 @@ def check_rc_r0(rc, r0):
 def check_r_array(r, r_low):
     '''check that radius array extends down to r_low, otherwise the model doesn't extend far enough for the given npoints and deltar'''
     r_small = r <= r_low
+    # jax.debug.print("r_small: {}", r_small)
+    # # print how many of r_small are True
+    # jax.debug.print("Number of points below r_low: {}", jnp.sum(r_small))
+    # jax.debug.print("r_low: {}", r_low)
     checkify.check(
         jnp.any(r_small),
-        "Radius points do not extend down to rlow. Increase npoints and/or deltar"
+        f"Radius points do not extend down to rlow. Increase npoints and/or deltar"
     )
 
 def xyz_stream(mass=0.5, r0=1e4, theta0=jnp.radians(30),
                phi0=jnp.radians(15), mu=0.1, v_r0=0,
-               inc=0, pa=0, rmin=None, deltar=1, npoints=10000):
+               inc=0, pa=0, rmin=None, deltar=1, npoints=1e6):
     '''
     it gets xyz coordinates and velocities for a stream line.
     They are also rotated in PA and inclination along the line of sight.
@@ -409,11 +412,12 @@ def xyz_stream(mass=0.5, r0=1e4, theta0=jnp.radians(30),
     phi_full = jnp.concatenate((jnp.asarray([phi0], dtype=FLOAT_DTYPE), phi))
     orb_ang0 = get_orb_ang(r_to_rc=1/mu, theta0=theta0, ecc=ecc)
     orb_ang_full = jnp.concatenate((jnp.asarray([orb_ang0], dtype=FLOAT_DTYPE), orb_ang))
-    v_r_full = jnp.concatenate((jnp.asarray([v_r0], dtype=FLOAT_DTYPE), v_r))
-    v_theta_full = jnp.concatenate((jnp.asarray([0.0], dtype=FLOAT_DTYPE), v_theta))
-    # we need to calculate v_phi0
-    v_phi0 = stream_state.vk0 * jnp.sin(theta0) * stream_state.mu
-    v_phi_full = jnp.concatenate((jnp.asarray([v_phi0], dtype=FLOAT_DTYPE), v_phi))
+    v_r0_consistent, v_theta0_consistent, v_phi0_consistent = stream_line_vel(
+        r0, theta0, orb_ang0, stream_state=stream_state, theta0=theta0, r_mask=None
+    )
+    v_r_full = jnp.concatenate((jnp.asarray([v_r0_consistent], dtype=FLOAT_DTYPE), v_r))
+    v_theta_full = jnp.concatenate((jnp.asarray([v_theta0_consistent], dtype=FLOAT_DTYPE), v_theta))
+    v_phi_full = jnp.concatenate((jnp.asarray([v_phi0_consistent], dtype=FLOAT_DTYPE), v_phi))
 
     # convert from spherical into cartesian coordinates
     v_x = v_r_full * jnp.sin(theta_full) * jnp.cos(phi_full) \

@@ -81,11 +81,26 @@ plot_morphology = outputs_module.plot_morphology
 plot_ra_vel = outputs_module.plot_ra_vel
 plot_dec_vel = outputs_module.plot_dec_vel
 plot_vel_radius = outputs_module.plot_vel_radius
+_mask_model_arrays = outputs_module._mask_model_arrays
 
 
 # ===========================================================================
 # Helpers
 # ===========================================================================
+
+def test_mask_model_arrays_removes_zero_padding_from_every_array():
+    valid_mask = np.array([True, True, False, False])
+    ra, dec, vel = _mask_model_arrays(
+        valid_mask,
+        np.array([3.0, 2.0, 0.0, 0.0]),
+        np.array([4.0, 1.0, 0.0, 0.0]),
+        np.array([7.0, 6.0, 0.0, 0.0]),
+    )
+
+    np.testing.assert_array_equal(ra, [3.0, 2.0])
+    np.testing.assert_array_equal(dec, [4.0, 1.0])
+    np.testing.assert_array_equal(vel, [7.0, 6.0])
+
 
 def _make_log_csv(tmp_path, epochs, loss, extra_cols=None):
     """Write a minimal optimisation_log.csv to *tmp_path*."""
@@ -104,11 +119,12 @@ def _make_streamer(n=8):
     dec = rng.uniform(-5.0, 5.0, n)
     v = rng.uniform(-3.0, 3.0, n)
     sig = np.full(n, 0.1)  # constant uncertainty for simplicity
-    # Generate some random point cloud coordinates that the streamer data came from
+    # # Generate mock point-cloud RA, Dec, velocity, and intensity arrays that the streamer data came from
     pc_coords=(
+        rng.uniform(-6.0, 6.0, 30), 
         rng.uniform(-6.0, 6.0, 30),
-        rng.uniform(-6.0, 6.0, 30),
-        rng.uniform(-4.0, 4.0, 30)
+        rng.uniform(-4.0, 4.0, 30),
+        rng.uniform(0.1, 1.0, 30),
     )
 
     import types
@@ -813,20 +829,6 @@ class TestPlotRaVelSmoke:
         )
         assert (tmp_path / "ra_vel_no_sigma.png").exists()
 
-    def test_with_model_keep_mask(self, tmp_path):
-        """model_keep mask filters the plotted model points."""
-        ra_m = np.linspace(0, 6, 20)
-        v_m  = np.linspace(-3, 3, 20)
-        keep = np.ones(20, dtype=bool)
-        keep[:5] = False
-        plot_ra_vel(
-            ra_m, v_m,
-            model_keep=keep,
-            save_folder=str(tmp_path),
-            save_name="ra_vel_keep",
-        )
-        assert (tmp_path / "ra_vel_keep.png").exists()
-
 
 # ===========================================================================
 # plot_dec_vel – smoke tests
@@ -923,8 +925,10 @@ class TestPlotVelRadiusSmoke:
         dec_m = np.linspace(0.5, 5.0, 30)
         v_m   = np.linspace(-3.0, 3.0, 30)
         plot_vel_radius(
-            ra_m, dec_m, v_m,
             streamer=s,
+            ra_model=ra_m,
+            dec_model=dec_m,
+            v_model=v_m,
             save_folder=str(tmp_path),
             save_name="vel_radius_basic",
         )
@@ -937,8 +941,10 @@ class TestPlotVelRadiusSmoke:
         dec_m = np.linspace(0.5, 5.0, 30)
         v_m   = np.linspace(-3.0, 3.0, 30)
         plot_vel_radius(
-            ra_m, dec_m, v_m,
             streamer=s,
+            ra_model=ra_m,
+            dec_model=dec_m,
+            v_model=v_m,
             ra_model_interp=s.ra_data,
             dec_model_interp=s.dec_data,
             v_model_interp=s.v_data,
@@ -951,10 +957,10 @@ class TestPlotVelRadiusSmoke:
     def test_with_velocity_reference(self, tmp_path):
         s = _make_streamer()
         plot_vel_radius(
-            np.linspace(1, 5, 20),
-            np.linspace(1, 5, 20),
-            np.linspace(-2, 2, 20),
             streamer=s,
+            ra_model=np.linspace(1, 5, 20),
+            dec_model=np.linspace(1, 5, 20),
+            v_model=np.linspace(-2, 2, 20),
             velocity_reference=0.5,
             save_folder=str(tmp_path),
             save_name="vel_radius_vlsr",
@@ -970,32 +976,15 @@ class TestPlotVelRadiusSmoke:
             np.linspace(-1, 1, 20),
         )
         plot_vel_radius(
-            np.linspace(1, 5, 20),
-            np.linspace(1, 5, 20),
-            np.linspace(-2, 2, 20),
             streamer=s,
+            ra_model=np.linspace(1, 5, 20),
+            dec_model=np.linspace(1, 5, 20),
+            v_model=np.linspace(-2, 2, 20),
             by_eye=by_eye,
             save_folder=str(tmp_path),
             save_name="vel_radius_by_eye",
         )
         assert (tmp_path / "vel_radius_by_eye.png").exists()
-
-    def test_with_model_keep_mask(self, tmp_path):
-        """model_keep masks out part of the model before plotting rproj."""
-        s = _make_streamer()
-        ra_m  = np.linspace(0, 6, 30)
-        dec_m = np.linspace(0, 6, 30)
-        v_m   = np.linspace(-3, 3, 30)
-        keep  = np.ones(30, dtype=bool)
-        keep[:5] = False
-        plot_vel_radius(
-            ra_m, dec_m, v_m,
-            streamer=s,
-            model_keep=keep,
-            save_folder=str(tmp_path),
-            save_name="vel_radius_keep",
-        )
-        assert (tmp_path / "vel_radius_keep.png").exists()
 
     def test_explicit_kde_background_skips_rebuild(self, tmp_path):
         """Passing a pre-built kde_background should skip the auto-build branch."""
@@ -1003,10 +992,10 @@ class TestPlotVelRadiusSmoke:
         rng = np.random.default_rng(3)
         kde = build_velocity_radius_kde(s.ra_data, s.dec_data, s.v_data)
         plot_vel_radius(
-            np.linspace(1, 5, 20),
-            np.linspace(1, 5, 20),
-            np.linspace(-2, 2, 20),
             streamer=s,
+            ra_model=np.linspace(1, 5, 20),
+            dec_model=np.linspace(1, 5, 20),
+            v_model=np.linspace(-2, 2, 20),
             kde_background=kde,
             save_folder=str(tmp_path),
             save_name="vel_radius_kde",
@@ -1016,10 +1005,10 @@ class TestPlotVelRadiusSmoke:
     def test_explicit_xlim_ylim(self, tmp_path):
         s = _make_streamer()
         plot_vel_radius(
-            np.linspace(1, 5, 20),
-            np.linspace(1, 5, 20),
-            np.linspace(-2, 2, 20),
             streamer=s,
+            ra_model=np.linspace(1, 5, 20),
+            dec_model=np.linspace(1, 5, 20),
+            v_model=np.linspace(-2, 2, 20),
             xlim=(0.0, 10.0),
             ylim=(-5.0, 5.0),
             save_folder=str(tmp_path),
@@ -1042,13 +1031,11 @@ class TestPlotVelRadiusSmoke:
             data=None, uncertainties=None,
         )
         plot_vel_radius(
-            np.linspace(1, 5, 10),
-            np.linspace(1, 5, 10),
-            np.linspace(-1, 1, 10),
             streamer=s,
+            ra_model=np.linspace(1, 5, 10),
+            dec_model=np.linspace(1, 5, 10),
+            v_model=np.linspace(-1, 1, 10),
             save_folder=str(tmp_path),
             save_name="vel_radius_no_sigma",
         )
         assert (tmp_path / "vel_radius_no_sigma.png").exists()
-
-

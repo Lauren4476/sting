@@ -41,6 +41,15 @@ def param_for_display(key, value):
     return key, float(value), unit
 
 
+def _mask_model_arrays(valid_mask, *arrays):
+    """Return model arrays containing only physically valid radial samples. (get rid of the zero-padding)
+    this mask is from rlow = max(rmin, 0.5*rc)
+    """
+    mask = np.asarray(valid_mask, dtype=bool)
+    return tuple(np.asarray(array)[mask] for array in arrays)
+
+
+
 def evaluate_best_fit(
     best_opt_params,
     fixed_params,
@@ -82,12 +91,21 @@ def evaluate_best_fit(
             jnp.asarray(dec_data, dtype=jnp.float64),
         )
     )
+
+    # Matching needs the fixed-length arrays and validity mask. Plotting must
+    # receive only the physical model, which ends at r_low.
+    ra_best, dec_best, v_best = _mask_model_arrays(
+        valid_mask_best, ra_best, dec_best, v_best
+    )
  
     by_eye = None
     if by_eye_params is not None:
         by_eye_full_params, _, _ = gradient_descent.prepare_model_params(by_eye_params, fixed_params)
-        ra_by_eye, dec_by_eye, v_by_eye, _, err_by_eye = gradient_descent.forward_model(by_eye_full_params, distance_pc)
+        ra_by_eye, dec_by_eye, v_by_eye, valid_mask_by_eye, err_by_eye = gradient_descent.forward_model(by_eye_full_params, distance_pc)
         err_by_eye.throw()
+        ra_by_eye, dec_by_eye, v_by_eye = _mask_model_arrays(
+            valid_mask_by_eye, ra_by_eye, dec_by_eye, v_by_eye
+        )
         by_eye = (ra_by_eye, dec_by_eye, v_by_eye)
  
     return dict(
@@ -394,7 +412,7 @@ def plot_morphology_by_epoch(
         ra_model, dec_model, v_model, valid_mask_model, err = gradient_descent.forward_model(model_params_epoch, distance)
         valid_mask_model = valid_mask_model.astype(bool)
 
-        (ra_model_interp, dec_model_interp, _, valid, model_keep, dmetric_model, matching_trace) = gradient_descent.checked_match_model_to_data_curve(
+        (ra_model_interp, dec_model_interp, _, valid, _, dmetric_model, matching_trace) = gradient_descent.checked_match_model_to_data_curve(
             ra_model,
             dec_model,
             v_model,
@@ -402,6 +420,8 @@ def plot_morphology_by_epoch(
             streamer.ra_data,
             streamer.dec_data,
         )
+
+        ra_model, dec_model, v_model = _mask_model_arrays(valid_mask_model, ra_model, dec_model, v_model)
 
         epoch_models.append(
             dict(
@@ -412,7 +432,6 @@ def plot_morphology_by_epoch(
                 ra_model_interp=np.asarray(ra_model_interp),
                 dec_model_interp=np.asarray(dec_model_interp),
                 valid=np.asarray(valid),
-                model_keep=np.asarray(model_keep),
             )
         )
 
@@ -488,6 +507,7 @@ def plot_morphology(
     save_folder='sting_results',
     save_name='streamline_morphology',
     show=True,
+    ax=None,
 ):
     '''Plot offsets in RA/Dec. Optionally include: model, model points, data points, best fit, background overlay, metric partitions.
     
@@ -505,7 +525,12 @@ def plot_morphology(
         dec_sigma = streamer.dec_sigma
         pc_coords = streamer.pc_coords
 
-    fig, ax = plt.subplots(figsize=(6.5, 7))
+    standalone = ax is None
+    if standalone:
+        fig, ax = plt.subplots(figsize=(6.5, 7))
+    else:
+        fig = ax.figure
+
     if valid is not None:
         valid = np.asarray(valid, dtype=bool)
 
@@ -613,14 +638,16 @@ def plot_morphology(
     ax.invert_xaxis()
     ax.set_title(title)
     ax.legend(loc=legend_loc)
-    if save_folder is not None:
-        # make dir if it doesn't exist
-        os.makedirs(save_folder, exist_ok=True)
-        plt.savefig(f'{save_folder}/{save_name}.png', dpi=300, bbox_inches='tight')
-    if show:
-        plt.show()
-    else:
-        plt.close(fig)
+
+    if standalone:
+        if save_folder is not None:
+            # make dir if it doesn't exist
+            os.makedirs(save_folder, exist_ok=True)
+            plt.savefig(f'{save_folder}/{save_name}.png', dpi=300, bbox_inches='tight')
+        if show:
+            plt.show()
+        else:
+            plt.close(fig)
 
 def plot_ra_vel_by_epoch(
     gradient_descent,
@@ -655,8 +682,12 @@ def plot_ra_vel_by_epoch(
         model_params_epoch = {**fixed_params_clean, **opt_params_epoch}
         ra_model, dec_model, v_model, valid_mask_model, err = gradient_descent.forward_model(model_params_epoch, distance)
         valid_mask_model = valid_mask_model.astype(bool)
-        ra_model_interp, _, v_model_interp, valid, model_keep, dmetric_model, matching_trace = (
+        ra_model_interp, _, v_model_interp, valid, _, dmetric_model, matching_trace = (
             gradient_descent.checked_match_model_to_data_curve(ra_model, dec_model, v_model, valid_mask_model, streamer.ra_data, streamer.dec_data)
+        )
+
+        ra_model, dec_model, v_model = _mask_model_arrays(
+            valid_mask_model, ra_model, dec_model, v_model
         )
 
         epoch_models.append({
@@ -666,7 +697,6 @@ def plot_ra_vel_by_epoch(
             "ra_model_interp": ra_model_interp,
             "v_model_interp": v_model_interp,
             "valid": valid,
-            "model_keep": model_keep,
         })
 
     # global velocity limits
@@ -697,7 +727,6 @@ def plot_ra_vel_by_epoch(
             ra_model_interp=model["ra_model_interp"],
             v_model_interp=model["v_model_interp"],
             valid=model["valid"],
-            model_keep=model["model_keep"],
             title=f"Epoch: {int(model['epoch'])}",
             vlim=vlim,
             ralim=ralim,
@@ -718,7 +747,6 @@ def plot_ra_vel(
     ra_model_interp=None,
     v_model_interp=None,
     valid=None,
-    model_keep=None,
     title=None,
     vlim=None,
     ralim=None,
@@ -743,8 +771,6 @@ def plot_ra_vel(
     v_model = np.asarray(v_model, dtype=float)
     if valid is not None:
         valid = np.asarray(valid, dtype=bool)
-    if model_keep is not None:
-        model_keep = np.asarray(model_keep, dtype=bool)
     fig, ax = plt.subplots(figsize=(6, 5))
     
 
@@ -824,8 +850,12 @@ def plot_dec_vel_by_epoch(
         model_params_epoch = {**fixed_params_clean, **opt_params_epoch}
         ra_model, dec_model, v_model, valid_mask_model, err = gradient_descent.forward_model(model_params_epoch, distance)
         valid_mask_model = valid_mask_model.astype(bool)
-        ra_model_interp, dec_model_interp, v_model_interp, valid, model_keep, dmetric_model, matching_trace = (
+        ra_model_interp, dec_model_interp, v_model_interp, valid, _, dmetric_model, matching_trace = (
             gradient_descent.checked_match_model_to_data_curve(ra_model, dec_model, v_model, valid_mask_model, streamer.ra_data, streamer.dec_data)
+        )
+
+        ra_model, dec_model, v_model = _mask_model_arrays(
+            valid_mask_model, ra_model, dec_model, v_model
         )
 
         epoch_models.append({
@@ -837,7 +867,6 @@ def plot_dec_vel_by_epoch(
             "dec_model_interp": dec_model_interp,
             "v_model_interp": v_model_interp,
             "valid": valid,
-            "model_keep": model_keep,
         })
 
     # global velocity limits
@@ -868,7 +897,6 @@ def plot_dec_vel_by_epoch(
             dec_model_interp=model["dec_model_interp"],
             v_model_interp=model["v_model_interp"],
             valid=model["valid"],
-            model_keep=model["model_keep"],
             title=f"Epoch: {int(model['epoch'])}",
             vlim=vlim,
             declim=declim,
@@ -889,7 +917,6 @@ def plot_dec_vel(
     dec_model_interp=None,
     v_model_interp=None,
     valid=None,
-    model_keep=None,
     title=None,
     vlim=None,
     declim=None,
@@ -914,8 +941,6 @@ def plot_dec_vel(
     v_model = np.asarray(v_model, dtype=float)
     if valid is not None:
         valid = np.asarray(valid, dtype=bool)
-    if model_keep is not None:
-        model_keep = np.asarray(model_keep, dtype=bool)
 
     fig, ax = plt.subplots(figsize=(6, 5))
 
@@ -959,7 +984,6 @@ def plot_dec_vel(
         plt.show()
     else:
         plt.close(fig)
-
 
 def build_velocity_radius_kde(
     ra_data,
@@ -1050,17 +1074,16 @@ def build_velocity_radius_kde(
 
 
 def plot_vel_radius(
-    ra_model,
-    dec_model,
-    v_model,
     streamer,
     *,
+    ra_model=None,
+    dec_model=None,
+    v_model=None,
     ra_model_interp=None,
     dec_model_interp=None,
     v_model_interp=None,
     valid=None,
     by_eye=None,
-    model_keep=None,
     kde_background=None,
     velocity_reference=None,
     title=None,
@@ -1070,8 +1093,9 @@ def plot_vel_radius(
     save_folder='sting_results',
     save_name=None,
     show=False,
+    ax=None,
 ):
-    """Plot velocity vs projected radius for one model (optionally with KDE background)."""
+    """Plot velocity vs projected radius(optionally with KDE background)."""
     ra_data = streamer.ra_data
     dec_data = streamer.dec_data
     v_data = streamer.v_data
@@ -1080,21 +1104,24 @@ def plot_vel_radius(
     v_sigma = streamer.v_sigma
     pc_coords = streamer.pc_coords
 
-    ra_model = np.asarray(ra_model, dtype=float)
-    dec_model = np.asarray(dec_model, dtype=float)
-    v_model = np.asarray(v_model, dtype=float)
-    if valid is not None:
-        valid = np.asarray(valid, dtype=bool)
-    if model_keep is not None:
-        model_keep = np.asarray(model_keep, dtype=bool)
-        ra_model = ra_model[model_keep]
-        dec_model = dec_model[model_keep]
-        v_model = v_model[model_keep]
+    if ra_model is not None and dec_model is not None and v_model is not None:
+        ra_model = np.asarray(ra_model, dtype=float)
+        dec_model = np.asarray(dec_model, dtype=float)
+        v_model = np.asarray(v_model, dtype=float)
+        if valid is not None:
+            valid = np.asarray(valid, dtype=bool)
+        # These arrays have already been cut with valid_mask_model, so their
+        # innermost point is the sample just outside r_low.
 
-    rproj_model = np.sqrt(ra_model**2 + dec_model**2)
-    order_model = np.argsort(rproj_model)
+        rproj_model = np.sqrt(ra_model**2 + dec_model**2)
+        order_model = np.argsort(rproj_model)
 
-    fig, ax = plt.subplots(figsize=(6.5 * 1.3, 4 * 1.3))
+    standalone = ax is None
+    if standalone:
+        fig, ax = plt.subplots(figsize=(6.5 * 1.3, 4 * 1.3))
+    else:
+        fig = ax.figure
+
     data_handle = None
     model_handle = None
     background_handle = None
@@ -1177,14 +1204,15 @@ def plot_vel_radius(
                 zorder=6,
             )[0]
 
-    model_handle, = ax.plot(
-        rproj_model[order_model],
-        v_model[order_model],
-        color=STING,
-        linewidth=2.5,
-        label='STING',
-        zorder=8,
-    )
+    if ra_model is not None and dec_model is not None and v_model is not None:
+        model_handle, = ax.plot(
+            rproj_model[order_model],
+            v_model[order_model],
+            color=STING,
+            linewidth=2.5,
+            label='STING',
+            zorder=8,
+        )
 
     if (
         ra_model_interp is not None
@@ -1251,14 +1279,14 @@ def plot_vel_radius(
     else:
         ax.legend(loc=legend_loc)
 
-    if save_folder is not None:
-        os.makedirs(save_folder, exist_ok=True)
-        plt.savefig(f'{save_folder}/{save_name}.png', dpi=300, bbox_inches='tight')
-    if show:
-        plt.show()
-    else:
-        plt.close(fig)
-
+    if standalone:
+        if save_folder is not None:
+            os.makedirs(save_folder, exist_ok=True)
+            plt.savefig(f'{save_folder}/{save_name}.png', dpi=300, bbox_inches='tight')
+        if show:
+            plt.show()
+        else:
+            plt.close(fig)
 
 def plot_vel_radius_by_epoch(
     gradient_descent,
@@ -1307,7 +1335,7 @@ def plot_vel_radius_by_epoch(
 
         valid_mask_model = valid_mask_model.astype(bool)
 
-        ra_model_interp, dec_model_interp, v_model_interp, valid, model_keep, dmetric_model, matching_trace = (
+        ra_model_interp, dec_model_interp, v_model_interp, valid, _, dmetric_model, matching_trace = (
             gradient_descent.checked_match_model_to_data_curve(
                 ra_model,
                 dec_model,
@@ -1318,8 +1346,9 @@ def plot_vel_radius_by_epoch(
             )
         )
 
-        if model_keep is not None:
-            model_keep = model_keep.astype(bool)
+        ra_model, dec_model, v_model = _mask_model_arrays(
+            valid_mask_model, ra_model, dec_model, v_model
+        )
 
         epoch_models.append({
             "epoch": epoch,
@@ -1330,7 +1359,6 @@ def plot_vel_radius_by_epoch(
             "dec_model_interp": dec_model_interp,
             "v_model_interp": v_model_interp,
             "valid": valid,
-            "model_keep": model_keep,
         })
 
     # Set consistent axis limits across epochs
@@ -1365,7 +1393,6 @@ def plot_vel_radius_by_epoch(
             dec_model_interp=model["dec_model_interp"],
             v_model_interp=model["v_model_interp"],
             valid=model["valid"],
-            model_keep=model["model_keep"],
             kde_background=kde_background,
             velocity_reference=velocity_reference,
             title=f"Epoch: {int(model['epoch'])}",
@@ -1731,5 +1758,3 @@ def load_optimisation_log(logs_dir):
     log_path = os.path.join(logs_dir, "optimisation_log.csv")
     optimisation_log = pd.read_csv(log_path)
     return optimisation_log
-
-
