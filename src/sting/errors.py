@@ -264,6 +264,7 @@ def estimate_parameter_errors(
     distance_pc,
     prepared_data,
     loss_method=0,
+    matching_method='legacy',
     gradient_tol=1e-1,
     normalisation_spec=None,
     best_norm_opt_params=None,
@@ -332,9 +333,14 @@ def estimate_parameter_errors(
     # convert dict -> vector
     params_vec, keys = params_dict_to_vector(params_for_hessian)
     loss_method = gradient_descent.check_loss_method(loss_method)
+    matching_method = gradient_descent.check_matching_method(matching_method)
 
-    # precompute model sort index at best fit params
-    model_sort_idx, dmetric_model = compute_model_sort_idx(best_opt_params, fixed_params, distance_pc, prepared_data, npoints=npoints)
+    # The frozen model sort is only part of the legacy interpolation Hessian.
+    if matching_method == 'legacy':
+        model_sort_idx, dmetric_model = compute_model_sort_idx(best_opt_params, fixed_params, distance_pc, prepared_data, npoints=npoints)
+    else:
+        model_sort_idx = None
+        dmetric_model = None
 
     if best_norm_opt_params is not None:
         norm_opt_params = best_norm_opt_params
@@ -352,18 +358,31 @@ def estimate_parameter_errors(
         norm_params = vector_to_params_dict(theta_norm_vec, norm_keys)
         physical_params = gradient_descent.denormalise_opt_params(norm_params, normalisation_spec)
         model_params = {**physical_params, **fixed_params}
-        chi2_total = chi2_loss_hsafe(
-            model_params,
-            distance_pc,
-            prepared_data,
-            loss_method=loss_method,
-            model_sort_idx=model_sort_idx,
-            dmetric_model_frozen=dmetric_model,
-            npoints=npoints,
-            priors_keys=priors_keys,
-            priors_means=priors_means,
-            priors_sigmas=priors_sigmas
-        )
+        if matching_method == 'continuous':
+            chi2_total, _, _ = gradient_descent.chi2_loss(
+                model_params,
+                distance_pc,
+                prepared_data,
+                loss_method=loss_method,
+                matching_method=matching_method,
+                npoints=npoints,
+                priors_keys=priors_keys,
+                priors_means=priors_means,
+                priors_sigmas=priors_sigmas,
+            )
+        else:
+            chi2_total = chi2_loss_hsafe(
+                model_params,
+                distance_pc,
+                prepared_data,
+                loss_method=loss_method,
+                model_sort_idx=model_sort_idx,
+                dmetric_model_frozen=dmetric_model,
+                npoints=npoints,
+                priors_keys=priors_keys,
+                priors_means=priors_means,
+                priors_sigmas=priors_sigmas
+            )
         return chi2_total
     
     def loss_vec(theta_vec):
@@ -372,18 +391,31 @@ def estimate_parameter_errors(
             params = dict(params)
             params['v_r0'] = gradient_descent.softplus(params['v_r0'])
         model_params = {**params, **fixed_params}
-        chi2_total = chi2_loss_hsafe(
-            model_params,
-            distance_pc,
-            prepared_data,
-            loss_method=loss_method,
-            model_sort_idx=model_sort_idx,
-            dmetric_model_frozen=dmetric_model,
-            npoints=npoints,
-            priors_keys=priors_keys,
-            priors_means=priors_means,
-            priors_sigmas=priors_sigmas
-        )
+        if matching_method == 'continuous':
+            chi2_total, _, _ = gradient_descent.chi2_loss(
+                model_params,
+                distance_pc,
+                prepared_data,
+                loss_method=loss_method,
+                matching_method=matching_method,
+                npoints=npoints,
+                priors_keys=priors_keys,
+                priors_means=priors_means,
+                priors_sigmas=priors_sigmas,
+            )
+        else:
+            chi2_total = chi2_loss_hsafe(
+                model_params,
+                distance_pc,
+                prepared_data,
+                loss_method=loss_method,
+                model_sort_idx=model_sort_idx,
+                dmetric_model_frozen=dmetric_model,
+                npoints=npoints,
+                priors_keys=priors_keys,
+                priors_means=priors_means,
+                priors_sigmas=priors_sigmas
+            )
         return chi2_total
     
 
@@ -399,6 +431,7 @@ def estimate_parameter_errors(
                 distance_pc,
                 prepared_data,
                 loss_method=loss_method,
+                matching_method=matching_method,
                 priors_keys=priors_keys,
                 priors_means=priors_means,
                 priors_sigmas=priors_sigmas

@@ -22,6 +22,7 @@ Run with:
 """
 
 import math
+import types
 
 import jax.numpy as jnp
 import numpy as np
@@ -95,6 +96,29 @@ class TestWrapToPi:
         assert result.shape == (3,)
         assert np.all(np.array(result) >= -math.pi)
         assert np.all(np.array(result) < math.pi)
+
+
+class TestPreparePointCloudData:
+    def test_filters_nonfinite_and_nonpositive_intensity(self):
+        streamer = types.SimpleNamespace(
+            pc_coords=jnp.array([
+                [1.0, 2.0, jnp.nan, 4.0],
+                [0.5, 1.0, 1.5, 2.0],
+                [3.0, 4.0, 5.0, 6.0],
+                [1.0, 0.0, 2.0, jnp.nan],
+            ]),
+            ra_sigma=jnp.ones(2),
+            dec_sigma=jnp.ones(2),
+            v_sigma=jnp.ones(2),
+            ra_data=jnp.ones(2),
+        )
+
+        prepared = es.prepare_point_cloud_data(streamer)
+
+        assert int(prepared.valid_points) == 1
+        assert int(prepared.total_points) == 4
+        assert float(prepared.intensity[0]) == 1.0
+        assert np.all(np.asarray(prepared.weights[1:]) == 0.0)
 
 
 # ===========================================================================

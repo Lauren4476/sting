@@ -29,6 +29,14 @@ PreparedData = namedtuple('PreparedData', [
     'r_proj_data', 'theta_proj_data',
 ])
 
+PreparedPointCloudData = namedtuple('PreparedPointCloudData', [
+    'ra_data', 'dec_data', 'v_data', 'intensity', 'weights',
+    'ra_sigma', 'dec_sigma', 'v_sigma',
+    'data_finite_mask', 'point_cloud_loss_scale',
+    'r_proj_data', 'theta_proj_data',
+    'valid_points', 'total_points',
+])
+
 StreamerData = namedtuple('StreamerData', [
     'pc_coords',
     'ra_data', 'dec_data', 'v_data',
@@ -426,6 +434,83 @@ def prepare_data(data, uncertainties, n_elements):
         data_max=data_max,
         r_proj_data=r_proj_data,
         theta_proj_data=theta_proj_data,
+    )
+
+
+def prepare_point_cloud_data(streamer, point_sigma_ra=None, point_sigma_dec=None, point_sigma_v=None, point_cloud_loss_scale=None):
+    '''Prepare raw point-cloud data for continuous matching. This is intentionally
+    separate from the legacy binned PreparedData container.
+    '''
+    if streamer is None or not hasattr(streamer, 'pc_coords'):
+        raise ValueError("streamer must provide a 'pc_coords' array for continuous matching.")
+
+    pc_coords = jnp.asarray(streamer.pc_coords, dtype=jnp.float64)
+    if pc_coords.shape[0] < 4:
+        raise ValueError("streamer.pc_coords must have shape (4, N): RA, Dec, velocity, intensity.")
+
+    ra_data = pc_coords[0]
+    dec_data = pc_coords[1]
+    v_data = pc_coords[2]
+    intensity = pc_coords[3]
+
+    finite_mask = (
+        jnp.isfinite(ra_data)
+        & jnp.isfinite(dec_data)
+        & jnp.isfinite(v_data)
+        & jnp.isfinite(intensity)
+        & (intensity > 0.0)
+    )
+    ra_data = jnp.where(finite_mask, ra_data, 0.0)
+    dec_data = jnp.where(finite_mask, dec_data, 0.0)
+    v_data = jnp.where(finite_mask, v_data, 0.0)
+    intensity = jnp.where(finite_mask, intensity, 0.0)
+    if not bool(jnp.any(finite_mask)):
+        raise ValueError("No positive finite intensity remains in streamer.pc_coords after preprocessing.")
+
+    if point_sigma_ra is None:
+        point_sigma_ra = jnp.median(jnp.asarray(streamer.ra_sigma, dtype=jnp.float64))
+    if point_sigma_dec is None:
+        point_sigma_dec = jnp.median(jnp.asarray(streamer.dec_sigma, dtype=jnp.float64))
+    if point_sigma_v is None:
+        point_sigma_v = jnp.median(jnp.asarray(streamer.v_sigma, dtype=jnp.float64))
+
+    point_sigma_ra = jnp.asarray(point_sigma_ra, dtype=jnp.float64)
+    point_sigma_dec = jnp.asarray(point_sigma_dec, dtype=jnp.float64)
+    point_sigma_v = jnp.asarray(point_sigma_v, dtype=jnp.float64)
+    if not bool(jnp.all(jnp.isfinite(point_sigma_ra))) or point_sigma_ra <= 0:
+        raise ValueError("point_sigma_ra must be finite and positive.")
+    if not bool(jnp.all(jnp.isfinite(point_sigma_dec))) or point_sigma_dec <= 0:
+        raise ValueError("point_sigma_dec must be finite and positive.")
+    if not bool(jnp.all(jnp.isfinite(point_sigma_v))) or point_sigma_v <= 0:
+        raise ValueError("point_sigma_v must be finite and positive.")
+
+    if point_cloud_loss_scale is None:
+        if hasattr(streamer, 'ra_data') and hasattr(streamer, 'dec_data'):
+            point_cloud_loss_scale = jnp.asarray(jnp.size(streamer.ra_data), dtype=jnp.float64)
+        else:
+            point_cloud_loss_scale = jnp.asarray(jnp.shape(ra_data)[0], dtype=jnp.float64)
+    point_cloud_loss_scale = jnp.asarray(point_cloud_loss_scale, dtype=jnp.float64)
+    if not bool(jnp.isfinite(point_cloud_loss_scale)) or point_cloud_loss_scale <= 0:
+        raise ValueError("point_cloud_loss_scale must be finite and positive.")
+
+    intensity_sum = jnp.sum(intensity)
+    weights = intensity / intensity_sum
+    r_proj_data, theta_proj_data = cartesian_to_polar(ra_data, dec_data)
+    return PreparedPointCloudData(
+        ra_data=ra_data,
+        dec_data=dec_data,
+        v_data=v_data,
+        intensity=intensity,
+        weights=weights,
+        ra_sigma=jnp.where(finite_mask, point_sigma_ra, 1.0),
+        dec_sigma=jnp.where(finite_mask, point_sigma_dec, 1.0),
+        v_sigma=jnp.where(finite_mask, point_sigma_v, 1.0),
+        data_finite_mask=finite_mask,
+        point_cloud_loss_scale=point_cloud_loss_scale,
+        r_proj_data=r_proj_data,
+        theta_proj_data=theta_proj_data,
+        valid_points=jnp.sum(finite_mask),
+        total_points=ra_data.size,
     )
 
 

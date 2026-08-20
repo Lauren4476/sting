@@ -344,6 +344,97 @@ def check_r_array(r, r_low):
         f"Radius points do not extend down to rlow. Increase npoints and/or deltar"
     )
 
+@jax.jit
+def evaluate_streamline_at_radius(r, mass, r0, theta0, phi0, mu, v_r0, inc, pa):
+    '''Evaluate the analytic Mendoza streamline at arbitrary radius or radius array.
+
+    This is the continuous analogue of the sampled xyz_stream() model: it computes
+    spherical geometry, cartesian coordinates, and rotated sky-plane projections
+    for a scalar or array of radii without constructing a sampling grid.
+    '''
+    r = jnp.asarray(r, dtype=FLOAT_DTYPE)
+    mass = jnp.asarray(mass, dtype=FLOAT_DTYPE)
+    r0 = jnp.asarray(r0, dtype=FLOAT_DTYPE)
+    theta0 = jnp.asarray(theta0, dtype=FLOAT_DTYPE)
+    phi0 = jnp.asarray(phi0, dtype=FLOAT_DTYPE)
+    mu = jnp.asarray(mu, dtype=FLOAT_DTYPE)
+    v_r0 = jnp.asarray(v_r0, dtype=FLOAT_DTYPE)
+    inc = jnp.asarray(inc, dtype=FLOAT_DTYPE)
+    pa = jnp.asarray(pa, dtype=FLOAT_DTYPE)
+
+    stream_state = build_stream_quantities(mass=mass, r0=r0, theta0=theta0, mu=mu, v_r0=v_r0)
+    rc = stream_state.rc
+    ecc = stream_state.ecc
+    rotation_matrix = build_rotation_matrix(inc, pa)
+
+    r_low = jnp.maximum(to_float64(0.0), rc * to_float64(0.5))
+    r_valid = (r >= r_low) & (r <= r0) & (r > 0.0)
+    r_for_eval = jnp.where(r_valid, r, r_low)
+
+    orb_ang0 = get_orb_ang(r_to_rc=1.0 / mu, theta0=theta0, ecc=ecc)
+    orb_ang = get_orb_ang(r_to_rc=r_for_eval / rc, theta0=theta0, ecc=ecc)
+    theta = get_theta(theta0, orb_ang, orb_ang0)
+    phi = phi0 + get_dphi(theta, theta0=theta0)
+
+    theta = jnp.where(r_valid, theta, theta0 + to_float64(0.1))
+    phi = jnp.where(r_valid, phi, phi0)
+    orb_ang = jnp.where(r_valid, orb_ang, orb_ang0)
+
+    v_r, v_theta, v_phi = stream_line_vel(
+        r_for_eval,
+        theta,
+        orb_ang,
+        stream_state=stream_state,
+        theta0=theta0,
+        r_mask=None,
+    )
+
+    v_x = v_r * jnp.sin(theta) * jnp.cos(phi) + v_theta * jnp.cos(theta) * jnp.cos(phi) - v_phi * jnp.sin(phi)
+    v_y = v_r * jnp.sin(theta) * jnp.sin(phi) + v_theta * jnp.cos(theta) * jnp.sin(phi) + v_phi * jnp.cos(phi)
+    v_z = v_r * jnp.cos(theta) - v_theta * jnp.sin(theta)
+    x = r_for_eval * jnp.sin(theta) * jnp.cos(phi)
+    y = r_for_eval * jnp.sin(theta) * jnp.sin(phi)
+    z = r_for_eval * jnp.cos(theta)
+
+    rotated_x, rotated_y, rotated_z = rotate_xyz(x, y, z, rotation_matrix=rotation_matrix)
+    rotated_v_x, rotated_v_y, rotated_v_z = rotate_xyz(v_x, v_y, v_z, rotation_matrix=rotation_matrix)
+
+    return (rotated_x, rotated_y, rotated_z), (rotated_v_x, rotated_v_y, rotated_v_z), r_valid
+
+@jax.jit
+def forward_model_at_radius(r, model_params, distance_pc):
+    '''Evaluate the analytic streamline model at arbitrary radii, returning sky-plane
+    offsets and velocity in the same conventions as forward_model().'''
+    distance_pc = jnp.asarray(distance_pc, dtype=FLOAT_DTYPE)
+
+    if 'mu' in model_params:
+        mu = model_params['mu']
+    elif 'rc' in model_params:
+        mu = model_params['rc'] / model_params['r0']
+    elif 'omega' in model_params:
+        mu = mu_from_omega(omega=model_params['omega'], mass=model_params['mass'], r0=model_params['r0'])
+    else:
+        raise ValueError("model_params must contain either 'rc', 'omega', or 'mu'")
+
+    model_params = dict(model_params)
+    model_params['mu'] = mu
+    (x, y, z), (vx, vy, vz), valid_mask = evaluate_streamline_at_radius(
+        r=r,
+        mass=model_params['mass'],
+        r0=model_params['r0'],
+        theta0=model_params['theta0'],
+        phi0=model_params['phi0'],
+        mu=model_params['mu'],
+        v_r0=model_params['v_r0'],
+        inc=model_params['inc'],
+        pa=model_params['pa'],
+    )
+
+    ra_model = -x / distance_pc
+    dec_model = z / distance_pc
+    v_model = vy + model_params['v_lsr']
+    return jnp.where(valid_mask, ra_model, 0.0), jnp.where(valid_mask, dec_model, 0.0), jnp.where(valid_mask, v_model, 0.0)
+
 def xyz_stream(mass=0.5, r0=1e4, theta0=jnp.radians(30),
                phi0=jnp.radians(15), mu=0.1, v_r0=0,
                inc=0, pa=0, rmin=None, deltar=1, npoints=1e6):

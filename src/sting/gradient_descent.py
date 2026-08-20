@@ -30,6 +30,7 @@ BIG = 1e30
 BIG_NEG = -1e30
 
 LOSS_METHOD_CHOICES = [0, 1]
+MATCHING_METHOD_CHOICES = ('continuous', 'legacy')
 
 LOSS_METHOD_COMPONENT_KEYS = {
     0: ('chi2_ra', 'chi2_dec', 'chi2_v', 'chi2_prior'), #radecvel
@@ -173,6 +174,16 @@ def check_loss_method(loss_method):
     return loss_method
 
 
+def check_matching_method(matching_method):
+    """Validate the selected matching mode and return it."""
+    if matching_method not in MATCHING_METHOD_CHOICES:
+        raise ValueError(
+            f"Unknown matching_method '{matching_method}'. "
+            f"Choose from: 'continuous' or 'legacy'."
+        )
+    return matching_method
+
+
 def trace_fieldnames_for_loss_method(loss_method):
     """Return the trace csv headers for the chosen loss method"""
     loss_method = check_loss_method(loss_method)
@@ -209,6 +220,8 @@ def inv_softplus(y):
 def get_checkify_error_message(err):
     """Extract human-readable error message from a checkify.Error if possible,
     or None if it doesn't contain anything"""
+    if err is None:
+        return None
     if hasattr(err, 'get'):
         return err.get()
     try:
@@ -821,6 +834,172 @@ def forward_model(model_params, distance_pc, npoints=1e6):
     return ra_model, dec_model, v_model, valid_mask, err
 
 
+@jax.jit(static_argnames=('loss_method',))
+def _continuous_objective_at_u(
+    u,
+    ra_data,
+    dec_data,
+    v_data,
+    ra_sigma,
+    dec_sigma,
+    v_sigma,
+    r0,
+    rmin,
+    model_params,
+    distance_pc,
+    loss_method,
+):
+    r_inner = jnp.maximum(rmin, to_float64(0.5) * model_params['mu'] * r0)
+    r = r_inner + u * (r0 - r_inner)
+    ra_model, dec_model, v_model = stream_lines_grad.forward_model_at_radius(
+        r,
+        model_params,
+        distance_pc,
+    )
+
+    if loss_method == 0:
+        q = ((ra_data - ra_model) / ra_sigma) ** 2 + ((dec_data - dec_model) / dec_sigma) ** 2 + ((v_data - v_model) / v_sigma) ** 2
+    else:
+        r_proj_data, theta_proj_data = extract_streamline.cartesian_to_polar(ra_data, dec_data)
+        r_proj_model, theta_proj_model = extract_streamline.cartesian_to_polar(ra_model, dec_model)
+        dtheta = extract_streamline.wrap_to_pi(theta_proj_data - theta_proj_model)
+        sigma_r = jnp.sqrt(ra_sigma ** 2 + dec_sigma ** 2)
+        r_eps = to_float64(1e-8)
+        r_safe = jnp.maximum(jnp.abs(r_proj_data), r_eps)
+        sigma_theta = jnp.sqrt((dec_data * ra_sigma) ** 2 + (ra_data * dec_sigma) ** 2) / (r_safe ** 2)
+        sigma_theta = jnp.maximum(sigma_theta, r_eps)
+        q = ((r_proj_data - r_proj_model) / sigma_r) ** 2 + (dtheta / sigma_theta) ** 2 + ((v_data - v_model) / v_sigma) ** 2
+    return q
+
+
+@jax.jit(static_argnames=('loss_method', 'n_iterations'))
+def golden_section_search_u(
+    r0,
+    rmin,
+    data_ra,
+    data_dec,
+    data_v,
+    sigma_ra,
+    sigma_dec,
+    sigma_v,
+    model_params,
+    distance_pc,
+    loss_method,
+    n_iterations=48,
+):
+    r_inner = jnp.maximum(rmin, to_float64(0.5) * model_params['mu'] * r0)
+    lower = jnp.zeros_like(data_ra, dtype=jnp.float64)
+    upper = jnp.ones_like(data_ra, dtype=jnp.float64)
+    golden_ratio = (jnp.sqrt(to_float64(5.0)) - to_float64(1.0)) / to_float64(2.0)
+    u1 = upper - golden_ratio * (upper - lower)
+    u2 = lower + golden_ratio * (upper - lower)
+
+    def body_fn(i, state):
+        lower_i, upper_i, u1_i, u2_i = state
+        q1 = _continuous_objective_at_u(u1_i, data_ra, data_dec, data_v, sigma_ra, sigma_dec, sigma_v, r0, rmin, model_params, distance_pc, loss_method)
+        q2 = _continuous_objective_at_u(u2_i, data_ra, data_dec, data_v, sigma_ra, sigma_dec, sigma_v, r0, rmin, model_params, distance_pc, loss_method)
+        lower_next = jnp.where(q1 <= q2, lower_i, u1_i)
+        upper_next = jnp.where(q1 <= q2, u2_i, upper_i)
+        u1_next = upper_next - golden_ratio * (upper_next - lower_next)
+        u2_next = lower_next + golden_ratio * (upper_next - lower_next)
+        return lower_next, upper_next, u1_next, u2_next
+
+    lower_f, upper_f, _, _ = jax.lax.fori_loop(0, n_iterations, body_fn, (lower, upper, u1, u2))
+    best_u = (lower_f + upper_f) / to_float64(2.0)
+    best_u = jax.lax.stop_gradient(best_u)
+    best_radius = r_inner + best_u * (r0 - r_inner)
+    return best_u, best_radius
+
+
+@jax.jit
+def match_continuous_model_to_point_cloud(
+    ra_model_full,
+    dec_model_full,
+    v_model_full,
+    valid_mask_model,
+    ra_data,
+    dec_data,
+    v_data,
+    intensity,
+    ra_sigma,
+    dec_sigma,
+    v_sigma,
+    model_params,
+    distance_pc,
+    loss_method=0,
+    point_cloud_loss_scale=None,
+):
+    ra_data = jnp.asarray(ra_data, dtype=jnp.float64)
+    dec_data = jnp.asarray(dec_data, dtype=jnp.float64)
+    v_data = jnp.asarray(v_data, dtype=jnp.float64)
+    ra_sigma = jnp.asarray(ra_sigma, dtype=jnp.float64)
+    dec_sigma = jnp.asarray(dec_sigma, dtype=jnp.float64)
+    v_sigma = jnp.asarray(v_sigma, dtype=jnp.float64)
+    intensity = jnp.asarray(intensity, dtype=jnp.float64)
+
+    r0 = model_params['r0']
+    rmin = model_params.get('rmin', to_float64(0.0))
+    if rmin is None:
+        rmin = to_float64(0.0)
+    if point_cloud_loss_scale is None:
+        point_cloud_loss_scale = jnp.asarray(ra_data.size, dtype=jnp.float64)
+    else:
+        point_cloud_loss_scale = jnp.asarray(point_cloud_loss_scale, dtype=jnp.float64)
+
+    best_u, best_radius = golden_section_search_u(
+        r0=r0,
+        rmin=rmin,
+        data_ra=ra_data,
+        data_dec=dec_data,
+        data_v=v_data,
+        sigma_ra=ra_sigma,
+        sigma_dec=dec_sigma,
+        sigma_v=v_sigma,
+        model_params=model_params,
+        distance_pc=distance_pc,
+        loss_method=loss_method,
+        n_iterations=48,
+    )
+
+    ra_model, dec_model, v_model = stream_lines_grad.forward_model_at_radius(
+        best_radius,
+        model_params,
+        distance_pc,
+    )
+    if loss_method == 0:
+        residual_ra = (ra_data - ra_model) / ra_sigma
+        residual_dec = (dec_data - dec_model) / dec_sigma
+        residual_v = (v_data - v_model) / v_sigma
+        weighted_term = intensity / jnp.sum(intensity)
+        weighted_loss = point_cloud_loss_scale * jnp.sum(weighted_term * (residual_ra ** 2 + residual_dec ** 2 + residual_v ** 2))
+        return best_u, best_radius, ra_model, dec_model, v_model, weighted_loss, residual_ra, residual_dec, residual_v, {
+            'point_cloud_loss_scale': point_cloud_loss_scale,
+            'intensity_sum': jnp.sum(intensity),
+            'intensity_min': jnp.min(intensity),
+            'intensity_max': jnp.max(intensity),
+        }
+
+    r_proj_data, theta_proj_data = extract_streamline.cartesian_to_polar(ra_data, dec_data)
+    r_proj_model, theta_proj_model = extract_streamline.cartesian_to_polar(ra_model, dec_model)
+    dtheta = extract_streamline.wrap_to_pi(theta_proj_data - theta_proj_model)
+    sigma_r = jnp.sqrt(ra_sigma ** 2 + dec_sigma ** 2)
+    r_eps = to_float64(1e-8)
+    r_safe = jnp.maximum(jnp.abs(r_proj_data), r_eps)
+    sigma_theta = jnp.sqrt((dec_data * ra_sigma) ** 2 + (ra_data * dec_sigma) ** 2) / (r_safe ** 2)
+    sigma_theta = jnp.maximum(sigma_theta, r_eps)
+    residual_r = (r_proj_data - r_proj_model) / sigma_r
+    residual_theta = dtheta / sigma_theta
+    residual_v = (v_data - v_model) / v_sigma
+    weighted_term = intensity / jnp.sum(intensity)
+    weighted_loss = point_cloud_loss_scale * jnp.sum(weighted_term * (residual_r ** 2 + residual_theta ** 2 + residual_v ** 2))
+    return best_u, best_radius, ra_model, dec_model, v_model, weighted_loss, residual_r, residual_theta, residual_v, {
+        'point_cloud_loss_scale': point_cloud_loss_scale,
+        'intensity_sum': jnp.sum(intensity),
+        'intensity_min': jnp.min(intensity),
+        'intensity_max': jnp.max(intensity),
+    }
+
+
 @jax.jit
 def distance_metric_overlap(dmetric_model, model_finite_mask, dmetric_data, data_finite_mask):
     """Compute the overlapping range in the streamline distance metric between data and model"""
@@ -957,12 +1136,13 @@ def checked_match_model_to_data_curve(*args, **kwargs):
     errors.throw()
     return result
 
-@jax.jit(static_argnames=("loss_method", "npoints", "priors_keys", "priors_means", "priors_sigmas"))
+@jax.jit(static_argnames=("loss_method", "matching_method", "npoints", "priors_keys", "priors_means", "priors_sigmas"))
 def chi2_loss(
     model_params,
     distance_pc,
     prepared_data,
     loss_method=0,
+    matching_method='continuous',
     npoints=1e6,
     priors_keys=(),
     priors_means=(),
@@ -977,147 +1157,195 @@ def chi2_loss(
     See compute_prior_penalty"""
  
     loss_method = check_loss_method(loss_method)
- 
+    matching_method = check_matching_method(matching_method)
     distance_pc = to_float64(distance_pc)
+
+    if matching_method == 'legacy':
+        ra_data = prepared_data.ra_data
+        dec_data = prepared_data.dec_data
+        v_data = prepared_data.v_data
+        ra_sigma = prepared_data.ra_sigma_safe
+        dec_sigma = prepared_data.dec_sigma_safe
+        v_sigma = prepared_data.v_sigma_safe
+
+        ra_model, dec_model, v_model, valid_mask_model, err = forward_model(model_params, distance_pc, npoints=npoints)
+        valid_mask_model = valid_mask_model.astype(jnp.bool_)
+
+        ra_model_interp, dec_model_interp, v_model_interp, valid, model_keep, dmetric_model, _ = (
+            checked_match_model_to_data_curve(ra_model, dec_model, v_model, valid_mask_model, ra_data, dec_data)
+        )
+
+        dmetric_data = prepared_data.dmetric_data
+        valid = jnp.asarray(valid, dtype=bool)
+        valid_weights = valid.astype(jnp.float64)
+
+        model_finite_mask = (
+            jnp.isfinite(ra_model)
+            & jnp.isfinite(dec_model)
+            & jnp.isfinite(v_model)
+            & jnp.isfinite(dmetric_model)
+        )
+
+        chi2_v = jnp.sum(valid_weights * (((v_data - v_model_interp) / v_sigma) ** 2))
+
+        if loss_method == 0:
+            chi2_ra = jnp.sum(valid_weights * (((ra_data - ra_model_interp) / ra_sigma) ** 2))
+            chi2_dec = jnp.sum(valid_weights * (((dec_data - dec_model_interp) / dec_sigma) ** 2))
+            chi2_total = chi2_ra + chi2_dec + chi2_v
+        else:
+            r_proj_data = prepared_data.r_proj_data
+            theta_proj_data = prepared_data.theta_proj_data
+            r_proj_model, theta_proj_model = extract_streamline.cartesian_to_polar(
+                ra_model_interp,
+                dec_model_interp,
+            )
+
+            dtheta = extract_streamline.wrap_to_pi(theta_proj_data - theta_proj_model)
+            sigma_r = jnp.sqrt(ra_sigma**2 + dec_sigma**2)
+            r_eps = to_float64(1e-8)
+            r_safe = jnp.maximum(jnp.abs(r_proj_data), r_eps)
+            sigma_theta = jnp.sqrt(((dec_data * ra_sigma)**2 + (ra_data * dec_sigma)**2)) / (r_safe**2)
+            sigma_theta = jnp.maximum(sigma_theta, r_eps)
+            chi2_r = jnp.sum(valid_weights * (((r_proj_data - r_proj_model) / sigma_r) ** 2))
+            chi2_theta = jnp.sum(valid_weights * ((dtheta / sigma_theta) ** 2))
+            chi2_total = chi2_r + chi2_theta + chi2_v
+
+        data_finite_mask = (
+            jnp.isfinite(ra_data)
+            & jnp.isfinite(dec_data)
+            & jnp.isfinite(dmetric_data)
+        )
  
+        model_min, model_max, data_min, data_max, overlap_min, overlap_max = distance_metric_overlap(
+            dmetric_model,
+            model_finite_mask,
+            dmetric_data,
+            data_finite_mask,
+        )
+ 
+        model_nan_count = jnp.sum(~model_finite_mask)
+        model_points_total = ra_model.size
+        model_valid_points = model_points_total - model_nan_count
+ 
+        data_keep = data_finite_mask & (dmetric_data >= overlap_min) & (dmetric_data <= overlap_max)
+        model_keep = model_finite_mask & (dmetric_model >= overlap_min) & (dmetric_model <= overlap_max)
+ 
+        sort_idx = jnp.argsort(dmetric_model)
+        d_model_sorted = dmetric_model[sort_idx]
+        d_diff = jnp.diff(d_model_sorted)
+        if d_diff.size > 0:
+            model_metric_min_gap = jnp.min(d_diff)
+            model_metric_near_tie_count = jnp.sum(jnp.abs(d_diff) <= 1e-8)
+            model_metric_duplicate_count = jnp.sum(d_diff == 0.0)
+            model_metric_non_monotonic_count = jnp.sum(d_diff < 0.0)
+        else:
+            model_metric_min_gap = to_float64(float('nan'))
+            model_metric_near_tie_count = to_float64(0.0)
+            model_metric_duplicate_count = to_float64(0.0)
+            model_metric_non_monotonic_count = to_float64(0.0)
+ 
+        model_metric_span = d_model_sorted[-1] - d_model_sorted[0] if d_model_sorted.size > 1 else to_float64(0.0)
+
+        chi2_prior = compute_prior_penalty(model_params, priors_means, priors_sigmas, priors_keys)
+        chi2_total = chi2_total + chi2_prior
+
+        if loss_method == 0:
+            chi2_components = {'chi2_ra': chi2_ra, 'chi2_dec': chi2_dec, 'chi2_v': chi2_v, 'chi2_prior': chi2_prior, 'overlap_width': overlap_max - overlap_min, 'chi2_total': chi2_total}
+        else:
+            chi2_components = {'chi2_r': chi2_r, 'chi2_theta': chi2_theta, 'chi2_v': chi2_v, 'chi2_prior': chi2_prior, 'overlap_width': overlap_max - overlap_min, 'chi2_total': chi2_total}
+
+        matching_trace = {'model_points_total': model_points_total, 'model_nan_count': model_nan_count, 'model_valid_points': model_valid_points, 'model_retained_count': jnp.sum(model_keep), 'data_points_total': ra_data.size, 'data_valid_points': jnp.sum(data_finite_mask), 'data_retained_count': jnp.sum(data_keep), 'overlap_metric_min': overlap_min, 'overlap_metric_max': overlap_max, 'model_metric_span': model_metric_span, 'model_metric_min_gap': model_metric_min_gap, 'model_metric_near_tie_count': model_metric_near_tie_count, 'model_metric_duplicate_count': model_metric_duplicate_count, 'model_metric_non_monotonic_count': model_metric_non_monotonic_count}
+        loss_trace = {'chi2_components': chi2_components, 'matching': matching_trace, 'loss_method': loss_method}
+        return chi2_total, loss_trace, None
+
     ra_data = prepared_data.ra_data
     dec_data = prepared_data.dec_data
     v_data = prepared_data.v_data
-    ra_sigma = prepared_data.ra_sigma_safe
-    dec_sigma = prepared_data.dec_sigma_safe
-    v_sigma = prepared_data.v_sigma_safe
- 
-    ra_model, dec_model, v_model, valid_mask_model, err = forward_model(model_params, distance_pc, npoints=npoints)
-    valid_mask_model = valid_mask_model.astype(jnp.bool_)
- 
-    ra_model_interp, dec_model_interp, v_model_interp, valid, model_keep, dmetric_model, _ = (
-        checked_match_model_to_data_curve(ra_model, dec_model, v_model, valid_mask_model, ra_data, dec_data)
-    )
- 
-    dmetric_data = prepared_data.dmetric_data
-    valid = jnp.asarray(valid, dtype=bool)
-    valid_weights = valid.astype(jnp.float64)
- 
-    model_finite_mask = (
-        jnp.isfinite(ra_model)
-        & jnp.isfinite(dec_model)
-        & jnp.isfinite(v_model)
-        & jnp.isfinite(dmetric_model)
-    )
- 
- 
-    # Only compute chi2 on valid/retained data points 
+    int_data = prepared_data.intensity
+    point_weights = prepared_data.weights
+    ra_sigma = prepared_data.ra_sigma
+    dec_sigma = prepared_data.dec_sigma
+    v_sigma = prepared_data.v_sigma
+    finite_mask = prepared_data.data_finite_mask
+    point_cloud_loss_scale = prepared_data.point_cloud_loss_scale
 
-    chi2_v = jnp.sum(valid_weights * (((v_data - v_model_interp) / v_sigma) ** 2))
- 
+    rmin = model_params.get('rmin', 0.0)
+    if rmin is None:
+        rmin = to_float64(0.0)
+    r0 = model_params['r0']
+
+    valid = finite_mask
+    weights = jnp.where(valid, point_weights, 0.0)
+    weights_sum = jnp.sum(weights)
+    weights = jnp.where(weights_sum > 0.0, weights / weights_sum, 0.0)
+
+    best_u, best_radius = golden_section_search_u(
+        r0=r0,
+        rmin=rmin,
+        data_ra=jnp.where(valid, ra_data, 0.0),
+        data_dec=jnp.where(valid, dec_data, 0.0),
+        data_v=jnp.where(valid, v_data, 0.0),
+        sigma_ra=jnp.where(valid, ra_sigma, 1.0),
+        sigma_dec=jnp.where(valid, dec_sigma, 1.0),
+        sigma_v=jnp.where(valid, v_sigma, 1.0),
+        model_params=model_params,
+        distance_pc=distance_pc,
+        loss_method=loss_method,
+        n_iterations=48,
+    )
+
+    ra_model, dec_model, v_model = stream_lines_grad.forward_model_at_radius(best_radius, model_params, distance_pc)
+    residual_ra = jnp.where(valid, (ra_data - ra_model) / ra_sigma, 0.0)
+    residual_dec = jnp.where(valid, (dec_data - dec_model) / dec_sigma, 0.0)
+    residual_v = jnp.where(valid, (v_data - v_model) / v_sigma, 0.0)
 
     if loss_method == 0:
-        chi2_ra = jnp.sum(valid_weights * (((ra_data - ra_model_interp) / ra_sigma) ** 2))
-        chi2_dec = jnp.sum(valid_weights * (((dec_data - dec_model_interp) / dec_sigma) ** 2))
-        chi2_total = chi2_ra + chi2_dec + chi2_v
+        q_point = residual_ra ** 2 + residual_dec ** 2 + residual_v ** 2
+        chi2_ra = jnp.sum(weights * residual_ra ** 2)
+        chi2_dec = jnp.sum(weights * residual_dec ** 2)
+        chi2_v = jnp.sum(weights * residual_v ** 2)
+        chi2_total = point_cloud_loss_scale * jnp.sum(weights * q_point)
     else:
-        r_proj_data = prepared_data.r_proj_data
-        theta_proj_data = prepared_data.theta_proj_data
-        r_proj_model, theta_proj_model = extract_streamline.cartesian_to_polar(
-            ra_model_interp,
-            dec_model_interp,
-        )
- 
+        r_proj_data, theta_proj_data = extract_streamline.cartesian_to_polar(ra_data, dec_data)
+        r_proj_model, theta_proj_model = extract_streamline.cartesian_to_polar(ra_model, dec_model)
         dtheta = extract_streamline.wrap_to_pi(theta_proj_data - theta_proj_model)
- 
-        sigma_r = jnp.sqrt(ra_sigma**2 + dec_sigma**2)
+        sigma_r = jnp.sqrt(ra_sigma ** 2 + dec_sigma ** 2)
         r_eps = to_float64(1e-8)
         r_safe = jnp.maximum(jnp.abs(r_proj_data), r_eps)
-        sigma_theta = jnp.sqrt(((dec_data * ra_sigma)**2 + (ra_data * dec_sigma)**2)) / (r_safe**2)
+        sigma_theta = jnp.sqrt((dec_data * ra_sigma) ** 2 + (ra_data * dec_sigma) ** 2) / (r_safe ** 2)
         sigma_theta = jnp.maximum(sigma_theta, r_eps)
- 
-        chi2_r = jnp.sum(valid_weights * (((r_proj_data - r_proj_model) / sigma_r) ** 2))
-        chi2_theta = jnp.sum(valid_weights * ((dtheta / sigma_theta) ** 2))
-        chi2_total = chi2_r + chi2_theta + chi2_v
- 
+        residual_r = jnp.where(valid, (r_proj_data - r_proj_model) / sigma_r, 0.0)
+        residual_theta = jnp.where(valid, dtheta / sigma_theta, 0.0)
+        chi2_r = jnp.sum(weights * residual_r ** 2)
+        chi2_theta = jnp.sum(weights * residual_theta ** 2)
+        chi2_v = jnp.sum(weights * residual_v ** 2)
+        chi2_total = point_cloud_loss_scale * jnp.sum(weights * (residual_r ** 2 + residual_theta ** 2 + residual_v ** 2))
 
-    data_finite_mask = (
-        jnp.isfinite(ra_data)
-        & jnp.isfinite(dec_data)
-        & jnp.isfinite(dmetric_data)
-    )
- 
-    model_min, model_max, data_min, data_max, overlap_min, overlap_max = distance_metric_overlap(
-        dmetric_model,
-        model_finite_mask,
-        dmetric_data,
-        data_finite_mask,
-    )
- 
-    model_nan_count = jnp.sum(~model_finite_mask)
-    model_points_total = ra_model.size
-    model_valid_points = model_points_total - model_nan_count
- 
-    data_keep = data_finite_mask & (dmetric_data >= overlap_min) & (dmetric_data <= overlap_max)
-    model_keep = model_finite_mask & (dmetric_model >= overlap_min) & (dmetric_model <= overlap_max)
- 
-    sort_idx = jnp.argsort(dmetric_model)
-    d_model_sorted = dmetric_model[sort_idx]
-    d_diff = jnp.diff(d_model_sorted)
-    if d_diff.size > 0:
-        model_metric_min_gap = jnp.min(d_diff)
-        model_metric_near_tie_count = jnp.sum(jnp.abs(d_diff) <= 1e-8)
-        model_metric_duplicate_count = jnp.sum(d_diff == 0.0)
-        model_metric_non_monotonic_count = jnp.sum(d_diff < 0.0)
-    else:
-        model_metric_min_gap = to_float64(float('nan'))
-        model_metric_near_tie_count = to_float64(0.0)
-        model_metric_duplicate_count = to_float64(0.0)
-        model_metric_non_monotonic_count = to_float64(0.0)
- 
-    model_metric_span = d_model_sorted[-1] - d_model_sorted[0] if d_model_sorted.size > 1 else to_float64(0.0)
-
-    # compute and add the prior penalty term to the total chi2 if priors are provided
     chi2_prior = compute_prior_penalty(model_params, priors_means, priors_sigmas, priors_keys)
     chi2_total = chi2_total + chi2_prior
- 
+
     if loss_method == 0:
-        chi2_components = {
-            'chi2_ra': chi2_ra,
-            'chi2_dec': chi2_dec,
-            'chi2_v': chi2_v,
-            'chi2_prior': chi2_prior,
-            'overlap_width': overlap_max - overlap_min,
-            'chi2_total': chi2_total,
-        }
+        chi2_components = {'chi2_ra': chi2_ra, 'chi2_dec': chi2_dec, 'chi2_v': chi2_v, 'chi2_prior': chi2_prior, 'chi2_total': chi2_total}
     else:
-        chi2_components = {
-            'chi2_r': chi2_r,
-            'chi2_theta': chi2_theta,
-            'chi2_v': chi2_v,
-            'chi2_prior': chi2_prior,
-            'overlap_width': overlap_max - overlap_min,
-            'chi2_total': chi2_total,
-        }
- 
+        chi2_components = {'chi2_r': chi2_r, 'chi2_theta': chi2_theta, 'chi2_v': chi2_v, 'chi2_prior': chi2_prior, 'chi2_total': chi2_total}
+
     matching_trace = {
-        'model_points_total': model_points_total,
-        'model_nan_count': model_nan_count,
-        'model_valid_points': model_valid_points,
-        'model_retained_count': jnp.sum(model_keep),
         'data_points_total': ra_data.size,
-        'data_valid_points': jnp.sum(data_finite_mask),
-        'data_retained_count': jnp.sum(data_keep),
-        'overlap_metric_min': overlap_min,
-        'overlap_metric_max': overlap_max,
-        'model_metric_span': model_metric_span,
-        'model_metric_min_gap': model_metric_min_gap,
-        'model_metric_near_tie_count': model_metric_near_tie_count,
-        'model_metric_duplicate_count': model_metric_duplicate_count,
-        'model_metric_non_monotonic_count': model_metric_non_monotonic_count,
+        'data_valid_points': jnp.sum(valid),
+        'matched_u_min': jnp.min(best_u),
+        'matched_u_max': jnp.max(best_u),
+        'matched_radius_min': jnp.min(best_radius),
+        'matched_radius_max': jnp.max(best_radius),
+        'point_cloud_loss_scale': point_cloud_loss_scale,
+        'intensity_min': jnp.min(int_data),
+        'intensity_max': jnp.max(int_data),
+        'intensity_sum': jnp.sum(int_data),
+        'search_iterations': 48,
+        'data_inner_count': jnp.sum(best_u <= 0.05),
+        'outer_boundary_count': jnp.sum(best_u >= 0.95),
     }
- 
-    loss_trace = {
-        'chi2_components': chi2_components,
-        'matching': matching_trace,
-        'loss_method': loss_method,
-    }
-    return chi2_total, loss_trace, err
+    loss_trace = {'chi2_components': chi2_components, 'matching': matching_trace, 'loss_method': loss_method}
+    return chi2_total, loss_trace, None
 
 
 
@@ -1213,6 +1441,7 @@ def evaluate_initial_guess(
     prepared_data = extract_streamline.prepare_data(data, uncertainties, n_elements=n_elements)
     chi2_total, loss_trace, _ = chi2_loss(
         model_params, distance_pc, prepared_data, loss_method=loss_method,
+        matching_method='legacy',
         priors_keys=priors_keys, priors_means=priors_means, priors_sigmas=priors_sigmas
     )
     chi2_components = loss_trace['chi2_components']
@@ -1239,9 +1468,14 @@ def fit_streamline(initial_opt_params, fixed_params, streamer, distance_pc,
                    early_stopping_patience=50,
                    save_folder='sting_results',
                    loss_method=1, # 0: radecvel, 1: rthetavel
+                   matching_method='continuous',
                    priors=None,
                    v_lsr=None,
-                   show_plots=False
+                   show_plots=False,
+                   point_sigma_ra=None,
+                   point_sigma_dec=None,
+                   point_sigma_v=None,
+                   point_cloud_loss_scale=None,
                    ):
     """
     Fit streamline model parameters to data using Adam optimiser.
@@ -1340,6 +1574,7 @@ def fit_streamline(initial_opt_params, fixed_params, streamer, distance_pc,
     from . import errors
     # Initialize parameters
     loss_method = check_loss_method(loss_method)
+    matching_method = check_matching_method(matching_method)
 
     opt_params, fixed_params = sanitize_param_partition(
         initial_opt_params,
@@ -1387,7 +1622,16 @@ def fit_streamline(initial_opt_params, fixed_params, streamer, distance_pc,
     opt_state = solver.init(opt_params_norm)
 
     # Precompute data-only quantities once before optimisation loop
-    prepared_data = extract_streamline.prepare_data(data, uncertainties, n_elements=len(data[0]))
+    if matching_method == 'continuous':
+        prepared_data = extract_streamline.prepare_point_cloud_data(
+            streamer,
+            point_sigma_ra=point_sigma_ra,
+            point_sigma_dec=point_sigma_dec,
+            point_sigma_v=point_sigma_v,
+            point_cloud_loss_scale=point_cloud_loss_scale,
+        )
+    else:
+        prepared_data = extract_streamline.prepare_data(data, uncertainties, n_elements=len(data[0]))
     # npoints for forward model evaluation: fixed large number set by max r0 bound and deltar
     # this is necessary to ensure forward model has constant array lengths for jax/jit compatability
     if 'r0' in param_bounds:
@@ -1408,6 +1652,7 @@ def fit_streamline(initial_opt_params, fixed_params, streamer, distance_pc,
             distance_pc,
             prepared_data,
             loss_method=loss_method,
+            matching_method=matching_method,
             npoints=npoints,
             priors_keys=priors_keys,
             priors_means=priors_means,
@@ -1472,7 +1717,7 @@ def fit_streamline(initial_opt_params, fixed_params, streamer, distance_pc,
     fieldnames = ['epoch', 'loss'] + [log_header(k) for k in opt_param_keys]
 
     all_param_keys = set(opt_param_keys) | set(fixed_params.keys())
-    if 'mu' in all_param_keys:
+    if save_folder is not None and 'mu' in all_param_keys:
         # also log derived rc and omega when mu is present for convenience
         if log_header('rc') not in fieldnames:
             fieldnames.append(log_header('rc'))
@@ -1697,6 +1942,7 @@ def fit_streamline(initial_opt_params, fixed_params, streamer, distance_pc,
             distance_pc,
             prepared_data,
             loss_method=loss_method,
+            matching_method=matching_method,
             gradient_tol=gradient_tol,
             normalisation_spec=normalisation_spec,
             best_norm_opt_params=best_opt_params_norm,
@@ -1736,7 +1982,13 @@ def fit_streamline(initial_opt_params, fixed_params, streamer, distance_pc,
         else:
             print(f"  {key}: {format_param(key, value)}")
 
-    outputs.save_best_fit_params(display_opt_params, display_fixed_params, display_param_errors, save_folder=save_folder)
+    if save_folder is not None:
+        outputs.save_best_fit_params(
+            display_opt_params,
+            display_fixed_params,
+            display_param_errors,
+            save_folder=save_folder,
+        )
 
     # now we will make some plots of the results
     if save_folder is not None:

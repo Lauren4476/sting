@@ -154,6 +154,8 @@ best_opt_params, loss_history, param_errors = gradient_descent.fit_streamline(
 
 This saves best-fit parameters, an optimisation log, and diagnostic plots to `sting_results/`. From there, the `outputs` module offers further plotting and analaysis tools.
 
+By default, `fit_streamline` matches the raw point cloud in `streamer.pc_coords` continuously. Each positive-intensity point is assigned its own radius by a bounded golden-section search, and the residuals are intensity-weighted. The effective loss scale can be adjusted with `point_cloud_loss_scale`; point uncertainties can be supplied with `point_sigma_ra`, `point_sigma_dec`, and `point_sigma_v`. To use the previous binned-data interpolation path, pass `matching_method='legacy'`.
+
 ## Recommended use case (best practice)
 
 STING is intended for fitting kinematic streamer models to interferometric molecular line observations (e.g. ALMA, NOEMA) of young stellar objects with asymmetric infall candidates visible in PPV space. It is best suited to:
