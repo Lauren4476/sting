@@ -22,6 +22,7 @@ import csv
 import astropy.units as u
 import math
 import traceback
+import types
 jax.config.update("jax_enable_x64", True)
 
 # settings and constants
@@ -30,7 +31,8 @@ BIG = 1e30
 BIG_NEG = -1e30
 
 LOSS_METHOD_CHOICES = [0, 1]
-MATCHING_METHOD_CHOICES = ('continuous', 'legacy')
+MATCHING_METHOD_CHOICES = ('continuous', 'continuous_point_cloud', 'legacy')
+MATCHING_ITERATIONS = 48
 
 LOSS_METHOD_COMPONENT_KEYS = {
     0: ('chi2_ra', 'chi2_dec', 'chi2_v', 'chi2_prior'), #radecvel
@@ -125,6 +127,12 @@ CovarianceResult = namedtuple(
     ]
 )
 
+ContinuousMatchResult = namedtuple(
+    'ContinuousMatchResult',
+    ['best_u', 'best_radius', 'ra_model_matched', 'dec_model_matched',
+     'v_model_matched', 'valid', 'residual_ra', 'residual_dec', 'residual_v'],
+)
+
 # Contains all the information about the model fit result, including best-fit parameters
 FitResult = namedtuple(
     'FitResult',
@@ -179,7 +187,7 @@ def check_matching_method(matching_method):
     if matching_method not in MATCHING_METHOD_CHOICES:
         raise ValueError(
             f"Unknown matching_method '{matching_method}'. "
-            f"Choose from: 'continuous' or 'legacy'."
+            f"Choose from: 'continuous', 'continuous_point_cloud', or 'legacy'."
         )
     return matching_method
 
@@ -911,6 +919,52 @@ def golden_section_search_u(
     return best_u, best_radius
 
 
+def match_continuous_model_to_data(prepared_data, model_params, distance_pc,
+                                   loss_method=0, matching_iterations=MATCHING_ITERATIONS):
+    """Match any prepared representative array directly to physical model radii."""
+    model_params = dict(model_params)
+    if 'mu' not in model_params:
+        if 'rc' in model_params:
+            model_params['mu'] = model_params['rc'] / model_params['r0']
+        elif 'omega' in model_params:
+            model_params['mu'] = stream_lines_grad.mu_from_omega(
+                omega=model_params['omega'],
+                mass=model_params['mass'],
+                r0=model_params['r0'],
+            )
+        else:
+            raise ValueError("model_params must contain 'mu', 'rc', or 'omega'.")
+    valid = jnp.asarray(prepared_data.data_finite_mask, dtype=bool)
+    best_u, best_radius = golden_section_search_u(
+        r0=model_params['r0'],
+        rmin=model_params.get('rmin', 0.0) or 0.0,
+        data_ra=jnp.where(valid, prepared_data.ra_data, 0.0),
+        data_dec=jnp.where(valid, prepared_data.dec_data, 0.0),
+        data_v=jnp.where(valid, prepared_data.v_data, 0.0),
+        sigma_ra=jnp.where(valid, prepared_data.ra_sigma, 1.0),
+        sigma_dec=jnp.where(valid, prepared_data.dec_sigma, 1.0),
+        sigma_v=jnp.where(valid, prepared_data.v_sigma, 1.0),
+        model_params=model_params,
+        distance_pc=distance_pc,
+        loss_method=loss_method,
+        n_iterations=matching_iterations,
+    )
+    ra_model, dec_model, v_model = stream_lines_grad.forward_model_at_radius(
+        best_radius, model_params, distance_pc
+    )
+    return ContinuousMatchResult(
+        best_u=best_u,
+        best_radius=best_radius,
+        ra_model_matched=ra_model,
+        dec_model_matched=dec_model,
+        v_model_matched=v_model,
+        valid=valid,
+        residual_ra=jnp.where(valid, (prepared_data.ra_data - ra_model) / prepared_data.ra_sigma, 0.0),
+        residual_dec=jnp.where(valid, (prepared_data.dec_data - dec_model) / prepared_data.dec_sigma, 0.0),
+        residual_v=jnp.where(valid, (prepared_data.v_data - v_model) / prepared_data.v_sigma, 0.0),
+    )
+
+
 @jax.jit
 def match_continuous_model_to_point_cloud(
     ra_model_full,
@@ -928,6 +982,7 @@ def match_continuous_model_to_point_cloud(
     distance_pc,
     loss_method=0,
     point_cloud_loss_scale=None,
+    matching_iterations=MATCHING_ITERATIONS,
 ):
     ra_data = jnp.asarray(ra_data, dtype=jnp.float64)
     dec_data = jnp.asarray(dec_data, dtype=jnp.float64)
@@ -958,7 +1013,7 @@ def match_continuous_model_to_point_cloud(
         model_params=model_params,
         distance_pc=distance_pc,
         loss_method=loss_method,
-        n_iterations=48,
+        n_iterations=matching_iterations,
     )
 
     ra_model, dec_model, v_model = stream_lines_grad.forward_model_at_radius(
@@ -1136,13 +1191,14 @@ def checked_match_model_to_data_curve(*args, **kwargs):
     errors.throw()
     return result
 
-@jax.jit(static_argnames=("loss_method", "matching_method", "npoints", "priors_keys", "priors_means", "priors_sigmas"))
+@jax.jit(static_argnames=("loss_method", "matching_method", "matching_iterations", "npoints", "priors_keys", "priors_means", "priors_sigmas"))
 def chi2_loss(
     model_params,
     distance_pc,
     prepared_data,
     loss_method=0,
     matching_method='continuous',
+    matching_iterations=MATCHING_ITERATIONS,
     npoints=1e6,
     priors_keys=(),
     priors_means=(),
@@ -1159,6 +1215,19 @@ def chi2_loss(
     loss_method = check_loss_method(loss_method)
     matching_method = check_matching_method(matching_method)
     distance_pc = to_float64(distance_pc)
+
+    if 'mu' not in model_params:
+        model_params = dict(model_params)
+        if 'rc' in model_params:
+            model_params['mu'] = model_params['rc'] / model_params['r0']
+        elif 'omega' in model_params:
+            model_params['mu'] = stream_lines_grad.mu_from_omega(
+                omega=model_params['omega'],
+                mass=model_params['mass'],
+                r0=model_params['r0'],
+            )
+        else:
+            raise ValueError("model_params must contain 'mu', 'rc', or 'omega'.")
 
     if matching_method == 'legacy':
         ra_data = prepared_data.ra_data
@@ -1291,7 +1360,7 @@ def chi2_loss(
         model_params=model_params,
         distance_pc=distance_pc,
         loss_method=loss_method,
-        n_iterations=48,
+        n_iterations=matching_iterations,
     )
 
     ra_model, dec_model, v_model = stream_lines_grad.forward_model_at_radius(best_radius, model_params, distance_pc)
@@ -1301,10 +1370,10 @@ def chi2_loss(
 
     if loss_method == 0:
         q_point = residual_ra ** 2 + residual_dec ** 2 + residual_v ** 2
-        chi2_ra = jnp.sum(weights * residual_ra ** 2)
-        chi2_dec = jnp.sum(weights * residual_dec ** 2)
-        chi2_v = jnp.sum(weights * residual_v ** 2)
-        chi2_total = point_cloud_loss_scale * jnp.sum(weights * q_point)
+        chi2_ra = point_cloud_loss_scale * jnp.sum(weights * residual_ra ** 2)
+        chi2_dec = point_cloud_loss_scale * jnp.sum(weights * residual_dec ** 2)
+        chi2_v = point_cloud_loss_scale * jnp.sum(weights * residual_v ** 2)
+        chi2_total = chi2_ra + chi2_dec + chi2_v
     else:
         r_proj_data, theta_proj_data = extract_streamline.cartesian_to_polar(ra_data, dec_data)
         r_proj_model, theta_proj_model = extract_streamline.cartesian_to_polar(ra_model, dec_model)
@@ -1316,10 +1385,10 @@ def chi2_loss(
         sigma_theta = jnp.maximum(sigma_theta, r_eps)
         residual_r = jnp.where(valid, (r_proj_data - r_proj_model) / sigma_r, 0.0)
         residual_theta = jnp.where(valid, dtheta / sigma_theta, 0.0)
-        chi2_r = jnp.sum(weights * residual_r ** 2)
-        chi2_theta = jnp.sum(weights * residual_theta ** 2)
-        chi2_v = jnp.sum(weights * residual_v ** 2)
-        chi2_total = point_cloud_loss_scale * jnp.sum(weights * (residual_r ** 2 + residual_theta ** 2 + residual_v ** 2))
+        chi2_r = point_cloud_loss_scale * jnp.sum(weights * residual_r ** 2)
+        chi2_theta = point_cloud_loss_scale * jnp.sum(weights * residual_theta ** 2)
+        chi2_v = point_cloud_loss_scale * jnp.sum(weights * residual_v ** 2)
+        chi2_total = chi2_r + chi2_theta + chi2_v
 
     chi2_prior = compute_prior_penalty(model_params, priors_means, priors_sigmas, priors_keys)
     chi2_total = chi2_total + chi2_prior
@@ -1340,7 +1409,7 @@ def chi2_loss(
         'intensity_min': jnp.min(int_data),
         'intensity_max': jnp.max(int_data),
         'intensity_sum': jnp.sum(int_data),
-        'search_iterations': 48,
+        'search_iterations': matching_iterations,
         'data_inner_count': jnp.sum(best_u <= 0.05),
         'outer_boundary_count': jnp.sum(best_u >= 0.95),
     }
@@ -1371,6 +1440,8 @@ def evaluate_initial_guess(
     distance_pc,
     n_elements=10,
     loss_method=0,
+    matching_method='continuous',
+    matching_iterations=MATCHING_ITERATIONS,
     priors=None,
 ):
     """
@@ -1430,18 +1501,41 @@ def evaluate_initial_guess(
     )
     err.throw()
  
-    ra_model_interp, dec_model_interp, v_model_interp, valid, _, _, _ = (
-        checked_match_model_to_data_curve(
-            ra_model, dec_model, v_model, valid_mask_model,
-            jnp.asarray(data[0], dtype=jnp.float64),
-            jnp.asarray(data[1], dtype=jnp.float64),
+    if matching_method == 'legacy':
+        ra_model_interp, dec_model_interp, v_model_interp, valid, _, _, _ = (
+            checked_match_model_to_data_curve(
+                ra_model, dec_model, v_model, valid_mask_model,
+                jnp.asarray(data[0], dtype=jnp.float64),
+                jnp.asarray(data[1], dtype=jnp.float64),
+            )
         )
-    )
- 
-    prepared_data = extract_streamline.prepare_data(data, uncertainties, n_elements=n_elements)
+        prepared_data = extract_streamline.prepare_data(data, uncertainties, n_elements=n_elements)
+    else:
+        pseudo_streamer = types.SimpleNamespace(
+            pc_coords=jnp.vstack((data[0], data[1], data[2], jnp.ones_like(data[0]))),
+            ra_sigma=uncertainties[0], dec_sigma=uncertainties[1], v_sigma=uncertainties[2],
+        )
+        if matching_method == 'continuous':
+            prepared_data = extract_streamline.prepare_binned_continuous_data(
+                pseudo_streamer, n_elements=n_elements
+            )
+        elif matching_method == 'continuous_point_cloud':
+            prepared_data = extract_streamline.prepare_point_cloud_data(pseudo_streamer)
+        else:
+            raise ValueError(f'Unknown matching_method: {matching_method}')
+        matched = match_continuous_model_to_data(
+            prepared_data, model_params, distance_pc,
+            loss_method=loss_method, matching_iterations=matching_iterations,
+        )
+        ra_model_interp = matched.ra_model_matched
+        dec_model_interp = matched.dec_model_matched
+        v_model_interp = matched.v_model_matched
+        valid = matched.valid
+
     chi2_total, loss_trace, _ = chi2_loss(
         model_params, distance_pc, prepared_data, loss_method=loss_method,
-        matching_method='legacy',
+        matching_method=matching_method,
+        matching_iterations=matching_iterations,
         priors_keys=priors_keys, priors_means=priors_means, priors_sigmas=priors_sigmas
     )
     chi2_components = loss_trace['chi2_components']
@@ -1469,6 +1563,7 @@ def fit_streamline(initial_opt_params, fixed_params, streamer, distance_pc,
                    save_folder='sting_results',
                    loss_method=1, # 0: radecvel, 1: rthetavel
                    matching_method='continuous',
+                   matching_iterations=MATCHING_ITERATIONS,
                    priors=None,
                    v_lsr=None,
                    show_plots=False,
@@ -1623,6 +1718,10 @@ def fit_streamline(initial_opt_params, fixed_params, streamer, distance_pc,
 
     # Precompute data-only quantities once before optimisation loop
     if matching_method == 'continuous':
+        prepared_data = extract_streamline.prepare_binned_continuous_data(
+            streamer, n_elements=len(data[0])
+        )
+    elif matching_method == 'continuous_point_cloud':
         prepared_data = extract_streamline.prepare_point_cloud_data(
             streamer,
             point_sigma_ra=point_sigma_ra,
@@ -1653,6 +1752,7 @@ def fit_streamline(initial_opt_params, fixed_params, streamer, distance_pc,
             prepared_data,
             loss_method=loss_method,
             matching_method=matching_method,
+            matching_iterations=matching_iterations,
             npoints=npoints,
             priors_keys=priors_keys,
             priors_means=priors_means,
@@ -1943,6 +2043,7 @@ def fit_streamline(initial_opt_params, fixed_params, streamer, distance_pc,
             prepared_data,
             loss_method=loss_method,
             matching_method=matching_method,
+            matching_iterations=matching_iterations,
             gradient_tol=gradient_tol,
             normalisation_spec=normalisation_spec,
             best_norm_opt_params=best_opt_params_norm,
@@ -2006,6 +2107,8 @@ def fit_streamline(initial_opt_params, fixed_params, streamer, distance_pc,
             save_folder=save_folder,
             show_plots=show_plots,
             transformed_cov_result=cov_transformed_dict,
+            matching_method=matching_method,
+            matching_iterations=matching_iterations,
         )
 
     # save results to CovarianceResult and FitResult namedtuples

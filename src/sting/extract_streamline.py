@@ -29,19 +29,24 @@ PreparedData = namedtuple('PreparedData', [
     'r_proj_data', 'theta_proj_data',
 ])
 
-PreparedPointCloudData = namedtuple('PreparedPointCloudData', [
+PreparedContinuousData = namedtuple('PreparedContinuousData', [
     'ra_data', 'dec_data', 'v_data', 'intensity', 'weights',
     'ra_sigma', 'dec_sigma', 'v_sigma',
     'data_finite_mask', 'point_cloud_loss_scale',
     'r_proj_data', 'theta_proj_data',
     'valid_points', 'total_points',
+    'bin_intensity', 'bin_count',
 ])
+
+# Compatibility name for callers of the original raw point-cloud helper.
+PreparedPointCloudData = PreparedContinuousData
 
 StreamerData = namedtuple('StreamerData', [
     'pc_coords',
     'ra_data', 'dec_data', 'v_data',
     'ra_sigma', 'dec_sigma', 'v_sigma',
     'data', 'uncertainties',
+    'bin_intensity', 'bin_count', 'dmetric_data',
 ])
 
 
@@ -105,6 +110,58 @@ def extract_streamer_subcube(cube, vmin=None, vmax=None, xmin=None, xmax=None, y
 
     return streamer_cube
 
+
+def _bin_point_cloud(pc_coords, n_elements):
+    """Return finite, positive-intensity metric-bin summaries in outer-first order."""
+    if n_elements < 1:
+        raise ValueError('n_elements must be >= 1')
+    pc_coords = np.asarray(pc_coords, dtype=float)
+    finite = (
+        np.isfinite(pc_coords[0]) & np.isfinite(pc_coords[1])
+        & np.isfinite(pc_coords[2]) & np.isfinite(pc_coords[3])
+        & (pc_coords[3] > 0.0)
+    )
+    if not np.any(finite):
+        raise ValueError('No finite points with positive intensity are available for binning.')
+
+    valid_coords = pc_coords[:, finite]
+    distance_metric = np.asarray(
+        get_distance_metric(valid_coords[0], valid_coords[1], n_elements=n_elements)[0],
+        dtype=float,
+    )
+    partitions = np.percentile(distance_metric, np.linspace(0.0, 100.0, n_elements + 1))
+    # searchsorted assigns each point to one interval, including both global endpoints.
+    bin_index = np.searchsorted(partitions[1:-1], distance_metric, side='right')
+
+    means = []
+    stds = []
+    intensities = []
+    counts = []
+    metrics = []
+    for index in range(n_elements):
+        selected = bin_index == index
+        if not np.any(selected):
+            continue
+        values = valid_coords[:3, selected]
+        weights = valid_coords[3, selected]
+        total = np.sum(weights)
+        mean = np.average(values, axis=1, weights=weights)
+        spread = np.sqrt(np.average((values - mean[:, None]) ** 2, axis=1, weights=weights))
+        means.append(mean)
+        stds.append(spread)
+        intensities.append(total)
+        counts.append(np.sum(selected))
+        metrics.append(np.average(distance_metric[selected], weights=weights))
+
+    order = np.argsort(metrics)[::-1]
+    return (
+        np.asarray(means, dtype=float)[order].T,
+        np.asarray(stds, dtype=float)[order].T,
+        np.asarray(intensities, dtype=float)[order],
+        np.asarray(counts, dtype=int)[order],
+        np.asarray(metrics, dtype=float)[order],
+    )
+
 def reduce_to_1D(streamer_cube, yso_centre, n_elements=10):
     '''
     Reduce a cube of emission to a 1D 'streamline' by weighted means
@@ -166,27 +223,9 @@ def reduce_to_1D(streamer_cube, yso_centre, n_elements=10):
     pc_v = v_coords[pc_z]
     pc_coords = np.array([pc_ra, pc_dec, pc_v, flux]) # shape (4, n_points): ra, dec, v, intensity  
 
-    # compute partitions for binning the point cloud
-    distance_metric, _ = get_distance_metric(pc_coords[0], pc_coords[1], n_elements=n_elements)
-    b_per = np.linspace(0, 100, n_elements+1) # percentiles to bin the pc into
-    partitions = np.array([np.percentile(distance_metric, per) for per in b_per])
-
-    # flux-weighted means and stds in each bin (ra, dec, v only -- intensity is not binned)
-    pc_ra_dec_v = pc_coords[:3]
-    pc_means = np.zeros((3, n_elements))
-    pc_stds = np.zeros((3, n_elements))
-    for i in range(n_elements):
-        distance_indices = (distance_metric > partitions[i]) & (distance_metric <= partitions[i+1])
-        pc_means[:, i] = np.average(pc_ra_dec_v.T[distance_indices],
-                                 axis=0,
-                                 weights=flux[distance_indices])
-        pc_stds[:, i] = np.sqrt(np.average((pc_ra_dec_v.T[distance_indices] - pc_means[:, i])**2,
-                                         axis=0,
-                                         weights=flux[distance_indices]))
-        
-    # flip arrays so that they go from large to small distance (towards star)
-    pc_means = pc_means[:, ::-1]
-    pc_stds = pc_stds[:, ::-1]
+    pc_means, pc_stds, bin_intensity, bin_count, distance_metric = _bin_point_cloud(
+        pc_coords, n_elements
+    )
  
     ra_data, dec_data, v_data = pc_means
     ra_sigma, dec_sigma, v_sigma = pc_stds
@@ -197,6 +236,9 @@ def reduce_to_1D(streamer_cube, yso_centre, n_elements=10):
         ra_sigma=ra_sigma, dec_sigma=dec_sigma, v_sigma=v_sigma,
         data=(ra_data, dec_data, v_data),
         uncertainties=(ra_sigma, dec_sigma, v_sigma),
+        bin_intensity=bin_intensity,
+        bin_count=bin_count,
+        dmetric_data=distance_metric,
     )
 
 
@@ -511,6 +553,47 @@ def prepare_point_cloud_data(streamer, point_sigma_ra=None, point_sigma_dec=None
         theta_proj_data=theta_proj_data,
         valid_points=jnp.sum(finite_mask),
         total_points=ra_data.size,
+        bin_intensity=intensity,
+        bin_count=jnp.where(finite_mask, 1, 0),
+    )
+
+
+def prepare_binned_continuous_data(streamer, n_elements=10):
+    """Prepare fixed intensity-weighted metric bins for continuous matching."""
+    if streamer is None or not hasattr(streamer, 'pc_coords'):
+        raise ValueError("streamer must provide a 'pc_coords' array for binning.")
+    pc_coords = np.asarray(streamer.pc_coords, dtype=float)
+    means, spreads, bin_intensity, bin_count, _ = _bin_point_cloud(pc_coords, n_elements)
+    fallback_sigmas = (
+        np.nanmedian(np.asarray(streamer.ra_sigma, dtype=float)),
+        np.nanmedian(np.asarray(streamer.dec_sigma, dtype=float)),
+        np.nanmedian(np.asarray(streamer.v_sigma, dtype=float)),
+    )
+    supplied = getattr(streamer, 'uncertainties', None)
+    if supplied is not None and all(np.size(values) == np.size(bin_intensity) for values in supplied):
+        spreads = np.asarray(supplied, dtype=float)
+    for axis in range(3):
+        invalid = ~np.isfinite(spreads[axis]) | (spreads[axis] <= 0.0)
+        spreads[axis, invalid] = fallback_sigmas[axis]
+    if not np.all(np.isfinite(spreads)) or np.any(spreads <= 0.0):
+        raise ValueError('Binned uncertainties must be finite and positive.')
+    weights = bin_intensity / np.sum(bin_intensity)
+    ra_data, dec_data, v_data = [jnp.asarray(values, dtype=jnp.float64) for values in means]
+    r_proj_data, theta_proj_data = cartesian_to_polar(ra_data, dec_data)
+    return PreparedContinuousData(
+        ra_data=ra_data, dec_data=dec_data, v_data=v_data,
+        intensity=jnp.asarray(bin_intensity, dtype=jnp.float64),
+        weights=jnp.asarray(weights, dtype=jnp.float64),
+        ra_sigma=jnp.asarray(spreads[0], dtype=jnp.float64),
+        dec_sigma=jnp.asarray(spreads[1], dtype=jnp.float64),
+        v_sigma=jnp.asarray(spreads[2], dtype=jnp.float64),
+        data_finite_mask=jnp.ones(len(bin_intensity), dtype=bool),
+        point_cloud_loss_scale=jnp.asarray(len(bin_intensity), dtype=jnp.float64),
+        r_proj_data=r_proj_data, theta_proj_data=theta_proj_data,
+        valid_points=jnp.asarray(len(bin_intensity)),
+        total_points=jnp.asarray(pc_coords.shape[1]),
+        bin_intensity=jnp.asarray(bin_intensity, dtype=jnp.float64),
+        bin_count=jnp.asarray(bin_count, dtype=jnp.int32),
     )
 
 

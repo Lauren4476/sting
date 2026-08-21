@@ -265,6 +265,7 @@ def estimate_parameter_errors(
     prepared_data,
     loss_method=0,
     matching_method='legacy',
+    matching_iterations=gradient_descent.MATCHING_ITERATIONS,
     gradient_tol=1e-1,
     normalisation_spec=None,
     best_norm_opt_params=None,
@@ -358,13 +359,14 @@ def estimate_parameter_errors(
         norm_params = vector_to_params_dict(theta_norm_vec, norm_keys)
         physical_params = gradient_descent.denormalise_opt_params(norm_params, normalisation_spec)
         model_params = {**physical_params, **fixed_params}
-        if matching_method == 'continuous':
+        if matching_method in ('continuous', 'continuous_point_cloud'):
             chi2_total, _, _ = gradient_descent.chi2_loss(
                 model_params,
                 distance_pc,
                 prepared_data,
                 loss_method=loss_method,
                 matching_method=matching_method,
+                matching_iterations=matching_iterations,
                 npoints=npoints,
                 priors_keys=priors_keys,
                 priors_means=priors_means,
@@ -391,13 +393,14 @@ def estimate_parameter_errors(
             params = dict(params)
             params['v_r0'] = gradient_descent.softplus(params['v_r0'])
         model_params = {**params, **fixed_params}
-        if matching_method == 'continuous':
+        if matching_method in ('continuous', 'continuous_point_cloud'):
             chi2_total, _, _ = gradient_descent.chi2_loss(
                 model_params,
                 distance_pc,
                 prepared_data,
                 loss_method=loss_method,
                 matching_method=matching_method,
+                matching_iterations=matching_iterations,
                 npoints=npoints,
                 priors_keys=priors_keys,
                 priors_means=priors_means,
@@ -432,6 +435,7 @@ def estimate_parameter_errors(
                 prepared_data,
                 loss_method=loss_method,
                 matching_method=matching_method,
+                matching_iterations=matching_iterations,
                 priors_keys=priors_keys,
                 priors_means=priors_means,
                 priors_sigmas=priors_sigmas
