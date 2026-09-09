@@ -2,7 +2,7 @@
 This file contains functions related to outputs from streamfit optimisation,
 such as saving logs and plotting results.
 
-Last updated: 03-06-26
+Last updated: 09-09-26
 '''
 import json
 import math
@@ -408,7 +408,7 @@ def make_morphology_background(pc_coords, metric_boundaries, ra_lim, dec_lim, fi
 
 
 def _evaluate_epoch_match(model_params, distance, streamer, matching_method,
-                          matching_iterations):
+                          matching_iterations, prepared=None):
     """Return model values matched by the same method used during fitting."""
     ra_model, dec_model, v_model, valid_mask_model, err = gradient_descent.forward_model(
         model_params, distance
@@ -423,11 +423,13 @@ def _evaluate_epoch_match(model_params, distance, streamer, matching_method,
             )[:4],
         )
     if matching_method == 'continuous':
-        prepared = extract_streamline.prepare_binned_continuous_data(
-            streamer, n_elements=len(streamer.ra_data)
-        )
+        if prepared is None:
+            prepared = extract_streamline.prepare_binned_continuous_data(
+                streamer, n_elements=len(streamer.ra_data)
+            )
     elif matching_method == 'continuous_point_cloud':
-        prepared = extract_streamline.prepare_point_cloud_data(streamer)
+        if prepared is None:
+            prepared = extract_streamline.prepare_point_cloud_data(streamer)
     else:
         raise ValueError(f'Unknown matching_method: {matching_method}')
     matched = gradient_descent.match_continuous_model_to_data(
@@ -467,40 +469,25 @@ def plot_morphology_by_epoch(
 
     epochs = optimisation_log['epoch'].values
 
-    # create the models
-    epoch_models = []
-    for idx, epoch in enumerate(epochs):
+    # prepare clean output folder for epoch frames
+    output_dir = os.path.join(save_folder, "epochs", "morphology")
+    _ensure_clean_dir(output_dir)
 
-        row = optimisation_log.iloc[idx]
-        opt_params_epoch = {param: float(row[column_map[param]]) for param in param_names}
-        model_params_epoch = {**fixed_params_clean, **opt_params_epoch}
-        (ra_model, dec_model, v_model, valid_mask_model,
-         ra_model_interp, dec_model_interp, _, valid) = _evaluate_epoch_match(
-            model_params_epoch, distance, streamer, matching_method, matching_iterations
+    if matching_method == 'continuous':
+        prepared = extract_streamline.prepare_binned_continuous_data(
+            streamer, n_elements=len(streamer.ra_data)
         )
-
-        ra_model, dec_model, v_model = _mask_model_arrays(valid_mask_model, ra_model, dec_model, v_model)
-
-        epoch_models.append(
-            dict(
-                epoch=epoch,
-                opt_params_epoch=opt_params_epoch,
-                ra_model=np.asarray(ra_model),
-                dec_model=np.asarray(dec_model),
-                ra_model_interp=np.asarray(ra_model_interp),
-                dec_model_interp=np.asarray(dec_model_interp),
-                valid=np.asarray(valid),
-            )
-        )
+    elif matching_method == 'continuous_point_cloud':
+        prepared = extract_streamline.prepare_point_cloud_data(streamer)
+    else:
+        prepared = None
 
     # get constant axis limits
     all_ra = np.concatenate([
-        *[e['ra_model'] for e in epoch_models],
         np.asarray(streamer.ra_data),
         np.asarray(streamer.pc_coords[0]),
     ])
     all_dec = np.concatenate([
-        *[e['dec_model'] for e in epoch_models],
         np.asarray(streamer.dec_data),
         np.asarray(streamer.pc_coords[1]),
     ])
@@ -514,32 +501,39 @@ def plot_morphology_by_epoch(
     ra_lim = (all_ra.min() - pad_ra, all_ra.max() + pad_ra)
     dec_lim = (all_dec.min() - pad_dec, all_dec.max() + pad_dec)
 
-    # prepare clean output folder for epoch frames
-    output_dir = os.path.join(save_folder, "epochs", "morphology")
-    _ensure_clean_dir(output_dir)
-
     partitions = extract_streamline.get_metric_partitions(streamer.pc_coords, n_points)
     metric_boundaries, trace = extract_streamline.sample_metric_boundaries(streamer.pc_coords, partitions)
 
     # pre-make the background image (point cloud and metric boundaries)
     bg_rgba, bg_extent = make_morphology_background(streamer.pc_coords, metric_boundaries, ra_lim, dec_lim)
 
-    # plot and save for each epoch
-    for model in epoch_models:
+    # evaluate, plot, and save each epoch incrementally
+    for idx, epoch in enumerate(epochs):
+        row = optimisation_log.iloc[idx]
+        opt_params_epoch = {param: float(row[column_map[param]]) for param in param_names}
+        model_params_epoch = {**fixed_params_clean, **opt_params_epoch}
+        (ra_model, dec_model, v_model, valid_mask_model,
+         ra_model_interp, dec_model_interp, _, valid) = _evaluate_epoch_match(
+            model_params_epoch, distance, streamer, matching_method,
+            matching_iterations, prepared=prepared
+        )
+        ra_model, dec_model, v_model = _mask_model_arrays(
+            valid_mask_model, ra_model, dec_model, v_model
+        )
         plot_morphology(
-            ra_model=model["ra_model"],
-            dec_model=model["dec_model"],
+            ra_model=np.asarray(ra_model),
+            dec_model=np.asarray(dec_model),
             streamer=streamer,
-            ra_model_interp=model["ra_model_interp"],
-            dec_model_interp=model["dec_model_interp"],
-            valid=model["valid"],
+            ra_model_interp=np.asarray(ra_model_interp),
+            dec_model_interp=np.asarray(dec_model_interp),
+            valid=np.asarray(valid),
             bg_rgba=bg_rgba,
             bg_extent=bg_extent,
-            title=f"Epoch: {int(model['epoch'])}",
+            title=f"Epoch: {int(epoch)}",
             xlim=ra_lim,
             ylim=dec_lim,
             save_folder=output_dir,
-            save_name=f"morphology_epoch_{int(model['epoch']):03d}",
+            save_name=f"morphology_epoch_{int(epoch):03d}",
             show=False
         )
 
@@ -706,7 +700,6 @@ def plot_morphology(
             plt.show()
         else:
             plt.close(fig)
-
 def plot_ra_vel_by_epoch(
     gradient_descent,
     fixed_params,
@@ -732,72 +725,60 @@ def plot_ra_vel_by_epoch(
 
     epochs = optimisation_log['epoch'].values
 
-    epoch_models = []
+    # make clean output folder
+    output_dir = os.path.join(save_folder, "epochs", "ra_vel")
+    _ensure_clean_dir(output_dir)
 
-    # make models
+    if matching_method == 'continuous':
+        prepared = extract_streamline.prepare_binned_continuous_data(
+            streamer, n_elements=len(streamer.ra_data)
+        )
+    elif matching_method == 'continuous_point_cloud':
+        prepared = extract_streamline.prepare_point_cloud_data(streamer)
+    else:
+        prepared = None
+
+    # global velocity limits
+    v_list = [streamer.v_data, streamer.pc_coords[2]]
+    all_v = np.concatenate(v_list)
+    vlim = (np.nanmin(all_v), np.nanmax(all_v))
+
+    # global RA limits
+    ra_list = [streamer.ra_data, streamer.pc_coords[0]]
+    all_ra = np.concatenate(ra_list)
+    ralim = (np.nanmin(all_ra), np.nanmax(all_ra))
+
+    # evaluate, plot, and save each epoch incrementally
     for idx, epoch in enumerate(epochs):
-
         row = optimisation_log.iloc[idx]
         opt_params_epoch = {param: float(row[column_map[param]]) for param in param_names}
         model_params_epoch = {**fixed_params_clean, **opt_params_epoch}
         (ra_model, dec_model, v_model, valid_mask_model,
          ra_model_interp, _, v_model_interp, valid) = _evaluate_epoch_match(
-            model_params_epoch, distance, streamer, matching_method, matching_iterations
+            model_params_epoch, distance, streamer, matching_method,
+            matching_iterations, prepared=prepared
         )
-
         ra_model, dec_model, v_model = _mask_model_arrays(
             valid_mask_model, ra_model, dec_model, v_model
         )
-
-        epoch_models.append({
-            "epoch": epoch,
-            "ra_model": ra_model,
-            "v_model": v_model,
-            "ra_model_interp": ra_model_interp,
-            "v_model_interp": v_model_interp,
-            "valid": valid,
-        })
-
-    # global velocity limits
-    v_list = [m["v_model"] for m in epoch_models]
-    if streamer is not None:
-        v_list.append(streamer.v_data)
-    all_v = np.concatenate(v_list)
-    vlim = (np.nanmin(all_v), np.nanmax(all_v))
-
-    # global RA limits
-    ra_list = [m["ra_model"] for m in epoch_models]
-    if streamer is not None:
-        ra_list.append(streamer.ra_data)
-    all_ra = np.concatenate(ra_list)
-    ralim = (np.nanmin(all_ra), np.nanmax(all_ra))
-
-    # make clean output folder
-    output_dir = os.path.join(save_folder, "epochs", "ra_vel")
-    _ensure_clean_dir(output_dir)
-
-
-    # make the plots
-    for model in epoch_models:
         plot_ra_vel(
-            ra_model=model["ra_model"],
-            v_model=model["v_model"],
+            ra_model=np.asarray(ra_model),
+            v_model=np.asarray(v_model),
             streamer=streamer,
-            ra_model_interp=model["ra_model_interp"],
-            v_model_interp=model["v_model_interp"],
-            valid=model["valid"],
-            title=f"Epoch: {int(model['epoch'])}",
+            ra_model_interp=np.asarray(ra_model_interp),
+            v_model_interp=np.asarray(v_model_interp),
+            valid=np.asarray(valid),
+            title=f"Epoch: {int(epoch)}",
             vlim=vlim,
             ralim=ralim,
             save_folder=output_dir,
-            save_name=f"ra_vel_epoch_{int(model['epoch']):03d}",
+            save_name=f"ra_vel_epoch_{int(epoch):03d}",
         )
 
     if make_video:
         input_pattern = os.path.join(output_dir, "ra_vel_epoch_%03d.png")
         create_video_from_images(output_dir, input_pattern, "streamline_ra_vel_evolution.mp4", fps=5)
-        
-
+   
 def plot_ra_vel(
     ra_model,
     v_model,
@@ -901,73 +882,60 @@ def plot_dec_vel_by_epoch(
 
     epochs = optimisation_log['epoch'].values
 
-    epoch_models = []
+    # make clean output folder
+    output_dir = os.path.join(save_folder, "epochs", "dec_vel")
+    _ensure_clean_dir(output_dir)
 
-    # make models
+    if matching_method == 'continuous':
+        prepared = extract_streamline.prepare_binned_continuous_data(
+            streamer, n_elements=len(streamer.ra_data)
+        )
+    elif matching_method == 'continuous_point_cloud':
+        prepared = extract_streamline.prepare_point_cloud_data(streamer)
+    else:
+        prepared = None
+
+    # global velocity limits
+    v_list = [streamer.v_data, streamer.pc_coords[2]]
+    all_v = np.concatenate(v_list)
+    vlim = (np.nanmin(all_v), np.nanmax(all_v))
+
+    # global dec limits
+    dec_list = [streamer.dec_data, streamer.pc_coords[1]]
+    all_dec = np.concatenate(dec_list)
+    declim = (np.nanmin(all_dec), np.nanmax(all_dec))
+
+    # evaluate, plot, and save each epoch incrementally
     for idx, epoch in enumerate(epochs):
-
         row = optimisation_log.iloc[idx]
         opt_params_epoch = {param: float(row[column_map[param]]) for param in param_names}
         model_params_epoch = {**fixed_params_clean, **opt_params_epoch}
         (ra_model, dec_model, v_model, valid_mask_model,
          ra_model_interp, dec_model_interp, v_model_interp, valid) = _evaluate_epoch_match(
-            model_params_epoch, distance, streamer, matching_method, matching_iterations
+            model_params_epoch, distance, streamer, matching_method,
+            matching_iterations, prepared=prepared
         )
-
         ra_model, dec_model, v_model = _mask_model_arrays(
             valid_mask_model, ra_model, dec_model, v_model
         )
-
-        epoch_models.append({
-            "epoch": epoch,
-            "ra_model": ra_model,
-            "dec_model": dec_model,
-            "v_model": v_model,
-            "ra_model_interp": ra_model_interp,
-            "dec_model_interp": dec_model_interp,
-            "v_model_interp": v_model_interp,
-            "valid": valid,
-        })
-
-    # global velocity limits
-    v_list = [m["v_model"] for m in epoch_models]
-    if streamer is not None:
-        v_list.append(streamer.v_data)
-    all_v = np.concatenate(v_list)
-    vlim = (np.nanmin(all_v), np.nanmax(all_v))
-
-    # global dec limits
-    dec_list = [m["dec_model"] for m in epoch_models]
-    if streamer is not None:
-        dec_list.append(streamer.dec_data)
-    all_dec = np.concatenate(dec_list)
-    declim = (np.nanmin(all_dec), np.nanmax(all_dec))
-
-    # make clean output folder
-    output_dir = os.path.join(save_folder, "epochs", "dec_vel")
-    _ensure_clean_dir(output_dir)
-
-
-    # make the plots
-    for model in epoch_models:
         plot_dec_vel(
-            dec_model=model["dec_model"],
-            v_model=model["v_model"],
+            dec_model=np.asarray(dec_model),
+            v_model=np.asarray(v_model),
             streamer=streamer,
-            dec_model_interp=model["dec_model_interp"],
-            v_model_interp=model["v_model_interp"],
-            valid=model["valid"],
-            title=f"Epoch: {int(model['epoch'])}",
+            dec_model_interp=np.asarray(dec_model_interp),
+            v_model_interp=np.asarray(v_model_interp),
+            valid=np.asarray(valid),
+            title=f"Epoch: {int(epoch)}",
             vlim=vlim,
             declim=declim,
             save_folder = output_dir,
-            save_name = f"dec_vel_epoch_{int(model['epoch']):03d}",
+            save_name = f"dec_vel_epoch_{int(epoch):03d}",
         )
 
     if make_video:
         input_pattern = os.path.join(output_dir, "dec_vel_epoch_%03d.png")
         create_video_from_images(output_dir, input_pattern, "streamline_dec_vel_evolution.mp4", fps=5)
-        
+         
 
 def plot_dec_vel(
     dec_model,
@@ -1375,7 +1343,19 @@ def plot_vel_radius_by_epoch(
     fixed_params_clean, initial_opt_params = gradient_descent.sanitize_param_partition(fixed_params, initial_opt_params, require_nonempty_opt=False)
     
     epochs = optimisation_log['epoch'].values
-    epoch_models = []
+
+    # make or clean output folder
+    output_dir = os.path.join(save_folder, "epochs", "vel_radius")
+    _ensure_clean_dir(output_dir)
+
+    if matching_method == 'continuous':
+        prepared = extract_streamline.prepare_binned_continuous_data(
+            streamer, n_elements=len(streamer.ra_data)
+        )
+    elif matching_method == 'continuous_point_cloud':
+        prepared = extract_streamline.prepare_point_cloud_data(streamer)
+    else:
+        prepared = None
 
     kde_background = None
     if streamer is not None:
@@ -1389,69 +1369,47 @@ def plot_vel_radius_by_epoch(
             sigma_levels=levels,
         )
 
-    for idx, epoch in enumerate(epochs):
-        row = optimisation_log.iloc[idx]
-        opt_params_epoch = {param: float(row[column_map[param]]) for param in param_names}
-        model_params_epoch = {**fixed_params_clean, **opt_params_epoch}
-        (ra_model, dec_model, v_model, valid_mask_model,
-         ra_model_interp, dec_model_interp, v_model_interp, valid) = _evaluate_epoch_match(
-            model_params_epoch, distance, streamer, matching_method, matching_iterations
-        )
-
-        ra_model, dec_model, v_model = _mask_model_arrays(
-            valid_mask_model, ra_model, dec_model, v_model
-        )
-
-        epoch_models.append({
-            "epoch": epoch,
-            "ra_model": ra_model,
-            "dec_model": dec_model,
-            "v_model": v_model,
-            "ra_model_interp": ra_model_interp,
-            "dec_model_interp": dec_model_interp,
-            "v_model_interp": v_model_interp,
-            "valid": valid,
-        })
-
     # Set consistent axis limits across epochs
-    rproj_list = []
-    v_list = [np.asarray(m["v_model"], dtype=float) for m in epoch_models]
-    for model in epoch_models:
-        ra_m = np.asarray(model["ra_model"], dtype=float)
-        dec_m = np.asarray(model["dec_model"], dtype=float)
-        rproj_list.append(np.sqrt(ra_m**2 + dec_m**2))
-
-    if streamer is not None:
-        rproj_list.append(np.sqrt(np.asarray(streamer.ra_data, dtype=float) ** 2 + np.asarray(streamer.dec_data, dtype=float) ** 2))
-    if streamer is not None and streamer.v_data is not None:
-        v_list.append(np.asarray(streamer.v_data, dtype=float))
+    rproj_list = [
+        np.sqrt(np.asarray(streamer.ra_data, dtype=float) ** 2 + np.asarray(streamer.dec_data, dtype=float) ** 2),
+        np.sqrt(np.asarray(streamer.pc_coords[0], dtype=float) ** 2 + np.asarray(streamer.pc_coords[1], dtype=float) ** 2),
+    ]
+    v_list = [np.asarray(streamer.v_data, dtype=float), np.asarray(streamer.pc_coords[2], dtype=float)]
 
     all_rproj = np.concatenate(rproj_list)
     all_v = np.concatenate(v_list)
     xlim = (np.nanmin(all_rproj), np.nanmax(all_rproj))
     ylim = (np.nanmin(all_v), np.nanmax(all_v))
 
-    # make or clean output folder
-    output_dir = os.path.join(save_folder, "epochs", "vel_radius")
-    _ensure_clean_dir(output_dir)
-
-    for model in epoch_models:
+    # evaluate, plot, and save each epoch incrementally
+    for idx, epoch in enumerate(epochs):
+        row = optimisation_log.iloc[idx]
+        opt_params_epoch = {param: float(row[column_map[param]]) for param in param_names}
+        model_params_epoch = {**fixed_params_clean, **opt_params_epoch}
+        (ra_model, dec_model, v_model, valid_mask_model,
+         ra_model_interp, dec_model_interp, v_model_interp, valid) = _evaluate_epoch_match(
+            model_params_epoch, distance, streamer, matching_method,
+            matching_iterations, prepared=prepared
+        )
+        ra_model, dec_model, v_model = _mask_model_arrays(
+            valid_mask_model, ra_model, dec_model, v_model
+        )
         plot_vel_radius(
-            ra_model=model["ra_model"],
-            dec_model=model["dec_model"],
-            v_model=model["v_model"],
+            ra_model=np.asarray(ra_model),
+            dec_model=np.asarray(dec_model),
+            v_model=np.asarray(v_model),
             streamer=streamer,
-            ra_model_interp=model["ra_model_interp"],
-            dec_model_interp=model["dec_model_interp"],
-            v_model_interp=model["v_model_interp"],
-            valid=model["valid"],
+            ra_model_interp=np.asarray(ra_model_interp),
+            dec_model_interp=np.asarray(dec_model_interp),
+            v_model_interp=np.asarray(v_model_interp),
+            valid=np.asarray(valid),
             kde_background=kde_background,
             velocity_reference=velocity_reference,
-            title=f"Epoch: {int(model['epoch'])}",
+            title=f"Epoch: {int(epoch)}",
             xlim=xlim,
             ylim=ylim,
             save_folder=output_dir,
-            save_name=f"vel_radius_epoch_{int(model['epoch']):03d}",
+            save_name=f"vel_radius_epoch_{int(epoch):03d}",
         )
 
     if make_video:

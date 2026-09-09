@@ -50,6 +50,7 @@ _gd.prepare_model_params = None
 _gd.forward_model = None
 _gd.checked_match_model_to_data_curve = None
 _gd.convert_and_strip_bound_units = None
+_gd.sanitize_param_partition = None
 
 _es = types.ModuleType("sting.extract_streamline")
 _es.get_distance_metric = None
@@ -1039,3 +1040,79 @@ class TestPlotVelRadiusSmoke:
             save_name="vel_radius_no_sigma",
         )
         assert (tmp_path / "vel_radius_no_sigma.png").exists()
+
+
+# ===========================================================================
+# Per-epoch plotting – cached preparation and incremental output
+# ===========================================================================
+
+@pytest.mark.parametrize(
+    "function_name,plot_name,subdir,extra_kwargs",
+    [
+        ("plot_morphology_by_epoch", "plot_morphology", "morphology", {"n_points": 10}),
+        ("plot_ra_vel_by_epoch", "plot_ra_vel", "ra_vel", {}),
+        ("plot_dec_vel_by_epoch", "plot_dec_vel", "dec_vel", {}),
+        ("plot_vel_radius_by_epoch", "plot_vel_radius", "vel_radius", {}),
+    ],
+)
+def test_by_epoch_prepares_once_and_saves_incrementally(
+    tmp_path, monkeypatch, capsys, function_name, plot_name, subdir, extra_kwargs
+):
+    _make_log_csv(tmp_path, [0, 1], [2.0, 1.0], extra_cols={"r0": [10.0, 11.0]})
+    streamer = _make_streamer()
+    output_dir = tmp_path / "epochs" / subdir
+    prepared = object()
+    events = []
+    prepare_calls = []
+
+    monkeypatch.setattr(
+        _gd, "sanitize_param_partition", lambda fixed, initial, require_nonempty_opt=False: (fixed, initial)
+    )
+    monkeypatch.setattr(
+        outputs_module.extract_streamline,
+        "prepare_binned_continuous_data",
+        lambda supplied_streamer, n_elements: prepare_calls.append((supplied_streamer, n_elements)) or prepared,
+    )
+
+    def fake_evaluate(model_params, distance, supplied_streamer, matching_method,
+                      matching_iterations, prepared=None):
+        assert output_dir.is_dir()
+        assert prepared is not None
+        events.append(("evaluate", model_params["r0"]))
+        model = np.array([1.0, 2.0, 3.0])
+        model_valid = np.ones(3, dtype=bool)
+        matched = np.arange(len(supplied_streamer.ra_data), dtype=float)
+        data_valid = np.ones(len(matched), dtype=bool)
+        return model, model, model, model_valid, matched, matched, matched, data_valid
+
+    monkeypatch.setattr(outputs_module, "_evaluate_epoch_match", fake_evaluate)
+    monkeypatch.setattr(
+        outputs_module, plot_name,
+        lambda **kwargs: events.append(("plot", int(kwargs["title"].split(": ")[1]))),
+    )
+
+    if function_name == "plot_morphology_by_epoch":
+        monkeypatch.setattr(outputs_module.extract_streamline, "get_metric_partitions", lambda *args, **kwargs: None)
+        monkeypatch.setattr(outputs_module.extract_streamline, "sample_metric_boundaries", lambda *args, **kwargs: (None, None))
+        monkeypatch.setattr(outputs_module, "make_morphology_background", lambda *args, **kwargs: (np.zeros((1, 1, 4)), [0, 1, 0, 1]))
+    elif function_name == "plot_vel_radius_by_epoch":
+        monkeypatch.setattr(
+            outputs_module, "build_velocity_radius_kde",
+            lambda *args, **kwargs: {"xlim": (0, 1), "ylim": (0, 1)},
+        )
+
+    getattr(outputs_module, function_name)(
+        gradient_descent=_gd,
+        fixed_params={},
+        initial_opt_params={"r0": 10.0},
+        distance=100.0,
+        streamer=streamer,
+        save_folder=str(tmp_path),
+        make_video=False,
+        matching_method="continuous",
+        matching_iterations=2,
+        **extra_kwargs,
+    )
+
+    assert prepare_calls == [(streamer, len(streamer.ra_data))]
+    assert events == [("evaluate", 10.0), ("plot", 0), ("evaluate", 11.0), ("plot", 1)]
