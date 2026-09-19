@@ -539,7 +539,7 @@ def plot_morphology_by_epoch(
 
     if make_video:
         input_pattern = os.path.join(output_dir, "morphology_epoch_%03d.png")
-        create_video_from_images(output_dir, input_pattern, "streamline_morphology_evolution.mp4", fps=5)
+        create_video_from_images(output_dir, input_pattern, "streamline_morphology_evolution.mp4", fps=15)
 
 def plot_morphology(
     ra_model=None,
@@ -1065,7 +1065,7 @@ def build_velocity_radius_kde(
     vlos = vlos[finite]
     if weights is not None:
         weights = weights[finite]
-    weights=None
+    # weights=None
     if xmin is None:
         xmin = float(np.nanmin(rproj) - 0.5)
     if xmax is None:
