@@ -83,8 +83,12 @@ def wrap_to_pi_numpy(angle):
     return (angle + np.pi) % (2.0 * np.pi) - np.pi
 
 
-def extract_streamer_subcube(cube, vmin=None, vmax=None, xmin=None, xmax=None, ymin=None, ymax=None, rms_thresh=None):
-    """Extract a subcube containing the streamer emission, by applying velocity and spatial limits, and masking out low SNR emission."""
+def extract_streamer_subcube(cube, vmin=None, vmax=None, xmin=None, xmax=None, ymin=None, ymax=None, rms_thresh=None, tpeak_thresh=None):
+    """Extract a subcube containing streamer emission and apply optional masks.
+
+    If both ``rms_thresh`` and ``tpeak_thresh`` are provided, ``rms_thresh``
+    takes precedence.
+    """
     streamer_cube = cube
     if (vmin is not None) and (vmax is not None):
         streamer_cube = streamer_cube.spectral_slab(vmin, vmax)
@@ -107,7 +111,9 @@ def extract_streamer_subcube(cube, vmin=None, vmax=None, xmin=None, xmax=None, y
     if rms_thresh is not None:
         rms_estimate = streamer_cube.mad_std()
         streamer_cube = streamer_cube.with_mask(streamer_cube > rms_thresh*rms_estimate) 
-
+    elif tpeak_thresh is not None:
+        streamer_cube = streamer_cube.with_mask(streamer_cube.max(axis=0) > tpeak_thresh)
+    
     return streamer_cube
 
 
