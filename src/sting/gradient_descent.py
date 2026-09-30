@@ -31,8 +31,13 @@ BIG = 1e30
 BIG_NEG = -1e30
 
 LOSS_METHOD_CHOICES = [0, 1]
-MATCHING_METHOD_CHOICES = ('continuous', 'continuous_point_cloud', 'legacy')
+MATCHING_METHOD_CHOICES = ('continuous', 'continuous_point_cloud', 'integrated', 'integrated_point_cloud', 'legacy')
+INTEGRATED_MATCHING_METHODS = ('integrated', 'integrated_point_cloud')
+POINT_CLOUD_MATCHING_METHODS = ('continuous_point_cloud', 'integrated_point_cloud')
 MATCHING_ITERATIONS = 48
+INTEGRATION_NODES = 128  # number of fixed in-plane angle nodes for the integrated methods
+INTEGRATION_BATCH_SIZE = 2048  # data points processed together in the integrated loss, to bound memory
+INTEGRATION_RESOLUTION_WARN = 1.0  # warn if matched segments are longer than this many sigma
 
 LOSS_METHOD_COMPONENT_KEYS = {
     0: ('chi2_ra', 'chi2_dec', 'chi2_v', 'chi2_prior'), #radecvel
@@ -198,7 +203,7 @@ def check_matching_method(matching_method):
     if matching_method not in MATCHING_METHOD_CHOICES:
         raise ValueError(
             f"Unknown matching_method '{matching_method}'. "
-            f"Choose from: 'continuous', 'continuous_point_cloud', or 'legacy'."
+            f"Choose from: {', '.join(repr(m) for m in MATCHING_METHOD_CHOICES)}."
         )
     return matching_method
 
@@ -1086,6 +1091,272 @@ def match_continuous_model_to_point_cloud(
     }
 
 
+def integration_delta_nodes(n_nodes=INTEGRATION_NODES):
+    """Fixed in-plane angle nodes for the integrated methods, from r0 (delta=0) to the disk midplane (delta=pi/2).
+    The nodes never depend on the model parameters, so the model is smooth in every parameter at every node."""
+    if n_nodes < 2:
+        raise ValueError('integration_nodes must be >= 2.')
+    return jnp.linspace(to_float64(0.0), to_float64(jnp.pi / 2), n_nodes)
+
+
+def polar_sigmas(ra_data, dec_data, ra_sigma, dec_sigma):
+    """Uncertainties on projected radius and polar angle of the data, as used by loss_method 1"""
+    sigma_r = jnp.sqrt(ra_sigma ** 2 + dec_sigma ** 2)
+    r_eps = to_float64(1e-8)
+    r_proj_data, _ = extract_streamline.cartesian_to_polar(ra_data, dec_data)
+    r_safe = jnp.maximum(jnp.abs(r_proj_data), r_eps)
+    sigma_theta = jnp.sqrt((dec_data * ra_sigma) ** 2 + (ra_data * dec_sigma) ** 2) / (r_safe ** 2)
+    sigma_theta = jnp.maximum(sigma_theta, r_eps)
+    return sigma_r, sigma_theta
+
+
+def _log1mexp(x):
+    """log(1 - exp(x)) for x < 0, stable for x near 0 and for x very negative"""
+    return jnp.where(x > -jnp.log(2.0), jnp.log(-jnp.expm1(x)), jnp.log1p(-jnp.exp(x)))
+
+
+def log_diff_ndtr(a, b):
+    """log(Phi(b) - Phi(a)) for b >= a, where Phi is the standard normal CDF. Stable in both tails.
+    Uses Phi(b) - Phi(a) = Phi(-a) - Phi(-b) to keep both arguments on the lower tail."""
+    flip = a > 0.0
+    lower = jnp.where(flip, -b, a)
+    upper = jnp.where(flip, -a, b)
+    log_upper = jax.scipy.special.log_ndtr(upper)
+    log_lower = jax.scipy.special.log_ndtr(lower)
+    # cap the log-ratio just below zero, so zero-length segments give a finite, negligible contribution
+    return log_upper + _log1mexp(jnp.minimum(log_lower - log_upper, to_float64(-1e-12)))
+
+
+def _integrated_point_terms(point, node_coords, node_physical, delta_nodes, loss_method):
+    """Integrated loss terms for a single data point. See integrated_match_terms."""
+    coords = jnp.stack(point[:3])
+    sigmas = jnp.stack(point[3:])
+
+    # segment vectors and point-minus-segment-start vectors, in sigma units
+    seg = node_coords[:, 1:] - node_coords[:, :-1]
+    to_point = coords[:, None] - node_coords[:, :-1]
+    if loss_method == 1:
+        seg = seg.at[1].set(extract_streamline.wrap_to_pi(seg[1]))
+        to_point = to_point.at[1].set(extract_streamline.wrap_to_pi(to_point[1]))
+    seg = seg / sigmas[:, None]
+    to_point = to_point / sigmas[:, None]
+
+    seg_len2 = jnp.maximum(jnp.sum(seg ** 2, axis=0), to_float64(1e-30))
+    seg_len = jnp.sqrt(seg_len2)
+    # position of the closest point on the (infinite) line through each segment, as a fraction of the segment
+    t_star = jnp.sum(to_point * seg, axis=0) / seg_len2
+    perp2 = jnp.sum((to_point - t_star * seg) ** 2, axis=0)
+    # log[(1/sqrt(2 pi)) * integral over the segment of exp(-q/2) ds]
+    lower = -seg_len * t_star
+    upper = seg_len * (1.0 - t_star)
+    log_mass = log_diff_ndtr(lower, upper)
+    log_seg = -0.5 * perp2 + log_mass
+    loss = -2.0 * jax.scipy.special.logsumexp(log_seg)
+
+    # diagnostics only (not part of the loss): each segment's share of the integral, and the expected
+    # matched point. Along a segment the weight is a normal in t truncated to [0, 1], with mean
+    # t_star + (pdf(lower) - pdf(upper)) / (seg_len * (cdf(upper) - cdf(lower)))
+    resp = jax.nn.softmax(log_seg)
+    log_pdf_norm = -0.5 * jnp.log(2.0 * jnp.pi)
+    pdf_ratio = (jnp.exp(-0.5 * lower ** 2 + log_pdf_norm - log_mass)
+                 - jnp.exp(-0.5 * upper ** 2 + log_pdf_norm - log_mass))
+    t_mean = jnp.clip(t_star + pdf_ratio / seg_len, 0.0, 1.0)
+    residual2 = (to_point - t_mean * seg) ** 2
+    seg_physical = node_physical[:, 1:] - node_physical[:, :-1]
+    matched_physical = jnp.sum(resp * (node_physical[:, :-1] + t_mean * seg_physical), axis=1)
+    matched_delta = jnp.sum(resp * (delta_nodes[:-1] + t_mean * (delta_nodes[1:] - delta_nodes[:-1])))
+    return {
+        'loss': loss,
+        'residual2': jnp.sum(resp * residual2, axis=1),
+        'matched_ra': matched_physical[0],
+        'matched_dec': matched_physical[1],
+        'matched_v': matched_physical[2],
+        'matched_delta': matched_delta,
+        'segment_length': jnp.sum(resp * seg_len),
+        'outer_end_weight': resp[0] * (t_star[0] < 0.0),
+        'inner_end_weight': resp[-1] * (t_star[-1] > 1.0),
+    }
+
+
+@jax.jit(static_argnames=('loss_method', 'batch_size'))
+def integrated_match_terms(
+    ra_nodes, dec_nodes, v_nodes, delta_nodes,
+    ra_data, dec_data, v_data, ra_sigma, dec_sigma, v_sigma,
+    loss_method=0, batch_size=INTEGRATION_BATCH_SIZE,
+):
+    """
+    Integrated (marginal) loss of each data point against the whole model streamline.
+
+    Instead of matching each data point to one model point, the Gaussian likelihood of the point is
+    integrated along the model curve, with position along the curve measured as arc length in
+    sigma-normalised (RA, Dec, v) or (r, theta, v) space:
+        loss_i = -2 log[ (1/sqrt(2 pi)) * integral exp(-q_i(s)/2) ds ]
+    where q_i is the chi2 of data point i against the model point at arc length s. The model is evaluated
+    analytically at fixed nodes, and the Gaussian is integrated exactly along the straight segment between each
+    pair of neighbouring nodes. Where the curve is locally straight, loss_i is the perpendicular chi2 of the point.
+    Nothing is sorted, searched for or matched, so the loss is smooth in the model parameters.
+    See docs/integrated_matching.tex.
+
+    Returns a dict of per-data-point arrays:
+        loss             : integrated loss of each point
+        residual2        : (3, N) segment-weighted squared residuals per coordinate (diagnostic only)
+        matched_ra/dec/v : segment-weighted expected matched model point (diagnostic only)
+        matched_delta    : segment-weighted expected in-plane angle of the match (diagnostic only)
+        segment_length   : segment-weighted segment length in sigma units. Values > ~1 mean integration_nodes is too small
+        outer_end_weight : share of the integral beyond r0
+        inner_end_weight : share of the integral beyond the disk midplane end
+    """
+    node_physical = jnp.stack([ra_nodes, dec_nodes, v_nodes])
+    if loss_method == 0:
+        node_coords = node_physical
+        data_coords = (ra_data, dec_data, v_data)
+        data_sigmas = (ra_sigma, dec_sigma, v_sigma)
+    else:
+        r_nodes, theta_nodes = extract_streamline.cartesian_to_polar(ra_nodes, dec_nodes)
+        node_coords = jnp.stack([r_nodes, theta_nodes, v_nodes])
+        r_data, theta_data = extract_streamline.cartesian_to_polar(ra_data, dec_data)
+        sigma_r, sigma_theta = polar_sigmas(ra_data, dec_data, ra_sigma, dec_sigma)
+        data_coords = (r_data, theta_data, v_data)
+        data_sigmas = (sigma_r, sigma_theta, v_sigma)
+
+    # checkpoint so reverse-mode recomputes per-batch intermediates rather than storing all N x K of them
+    point_fn = jax.checkpoint(
+        lambda point: _integrated_point_terms(point, node_coords, node_physical, delta_nodes, loss_method)
+    )
+    terms = jax.lax.map(point_fn, (*data_coords, *data_sigmas), batch_size=batch_size)
+    terms['residual2'] = terms['residual2'].T
+    return terms
+
+
+def outer_anchor_chi2(ra_start, dec_start, v_start, outer_point, outer_sigma, loss_method=0):
+    """chi2 between the start of the model (r0) and the outermost data point, in the coordinates of loss_method.
+
+    Neither the continuous nor the integrated loss penalises model length beyond the data, so on their own they
+    leave r0 weakly constrained from above. This term adds the assumption that the observed outer end of the streamer is where
+    the streamline starts. It is evaluated at a fixed node (delta = 0), so it is smooth in every parameter."""
+    ra_out, dec_out, v_out = outer_point[0], outer_point[1], outer_point[2]
+    ra_sigma, dec_sigma, v_sigma = outer_sigma[0], outer_sigma[1], outer_sigma[2]
+    if loss_method == 0:
+        residuals = jnp.stack([
+            (ra_out - ra_start) / ra_sigma,
+            (dec_out - dec_start) / dec_sigma,
+            (v_out - v_start) / v_sigma,
+        ])
+    else:
+        r_out, theta_out = extract_streamline.cartesian_to_polar(ra_out, dec_out)
+        r_start, theta_start = extract_streamline.cartesian_to_polar(ra_start, dec_start)
+        sigma_r, sigma_theta = polar_sigmas(ra_out, dec_out, ra_sigma, dec_sigma)
+        residuals = jnp.stack([
+            (r_out - r_start) / sigma_r,
+            extract_streamline.wrap_to_pi(theta_out - theta_start) / sigma_theta,
+            (v_out - v_start) / v_sigma,
+        ])
+    return jnp.sum(residuals ** 2)
+
+
+def integrated_model_nodes(model_params, distance_pc, integration_nodes=INTEGRATION_NODES):
+    """Evaluate the closed-form model at the fixed integration nodes"""
+    delta_nodes = integration_delta_nodes(integration_nodes)
+    ra_nodes, dec_nodes, v_nodes, r_nodes = stream_lines_grad.forward_model_at_delta(
+        delta_nodes, model_params, distance_pc
+    )
+    return delta_nodes, ra_nodes, dec_nodes, v_nodes, r_nodes
+
+
+def match_integrated_model_to_data(prepared_data, model_params, distance_pc, loss_method=0,
+                                   integration_nodes=INTEGRATION_NODES):
+    """Expected matched model point for each data point under the integrated methods. For plotting and
+    diagnostics only: the integrated loss itself never picks a single matched point."""
+    valid = jnp.asarray(prepared_data.data_finite_mask, dtype=bool)
+    delta_nodes, ra_nodes, dec_nodes, v_nodes, _ = integrated_model_nodes(
+        model_params, distance_pc, integration_nodes
+    )
+    terms = integrated_match_terms(
+        ra_nodes, dec_nodes, v_nodes, delta_nodes,
+        jnp.where(valid, prepared_data.ra_data, 0.0),
+        jnp.where(valid, prepared_data.dec_data, 0.0),
+        jnp.where(valid, prepared_data.v_data, 0.0),
+        jnp.where(valid, prepared_data.ra_sigma, 1.0),
+        jnp.where(valid, prepared_data.dec_sigma, 1.0),
+        jnp.where(valid, prepared_data.v_sigma, 1.0),
+        loss_method=loss_method,
+    )
+    _, _, _, matched_radius = stream_lines_grad.forward_model_at_delta(
+        terms['matched_delta'], model_params, distance_pc
+    )
+    ra_model = terms['matched_ra']
+    dec_model = terms['matched_dec']
+    v_model = terms['matched_v']
+    return ContinuousMatchResult(
+        best_u=terms['matched_delta'] / (jnp.pi / 2),
+        best_radius=matched_radius,
+        ra_model_matched=ra_model,
+        dec_model_matched=dec_model,
+        v_model_matched=v_model,
+        valid=valid,
+        residual_ra=jnp.where(valid, (prepared_data.ra_data - ra_model) / prepared_data.ra_sigma, 0.0),
+        residual_dec=jnp.where(valid, (prepared_data.dec_data - dec_model) / prepared_data.dec_sigma, 0.0),
+        residual_v=jnp.where(valid, (prepared_data.v_data - v_model) / prepared_data.v_sigma, 0.0),
+    )
+
+
+def prepare_matching_data(streamer, matching_method, n_elements=None, point_sigma_ra=None, point_sigma_dec=None,
+                          point_sigma_v=None, point_cloud_loss_scale=None, anchor_outer_point=True):
+    """Precompute the data container used by a continuous or integrated matching method (None for legacy).
+
+    With anchor_outer_point=True, the outermost metric bin of the point cloud and its uncertainties are stored as
+    outer_point/outer_sigma, and chi2_loss then ties the start of the model (r0) to it."""
+    matching_method = check_matching_method(matching_method)
+    if matching_method == 'legacy':
+        return None
+    if n_elements is None:
+        n_elements = len(streamer.ra_data)
+    binned = extract_streamline.prepare_binned_continuous_data(streamer, n_elements=n_elements)
+    if matching_method in POINT_CLOUD_MATCHING_METHODS:
+        prepared = extract_streamline.prepare_point_cloud_data(
+            streamer,
+            point_sigma_ra=point_sigma_ra,
+            point_sigma_dec=point_sigma_dec,
+            point_sigma_v=point_sigma_v,
+            point_cloud_loss_scale=point_cloud_loss_scale,
+        )
+    else:
+        prepared = binned
+    if anchor_outer_point:
+        # bins are in outer-first order of the distance metric, so bin 0 is the outermost
+        prepared = prepared._replace(
+            outer_point=jnp.stack([binned.ra_data[0], binned.dec_data[0], binned.v_data[0]]),
+            outer_sigma=jnp.stack([binned.ra_sigma[0], binned.dec_sigma[0], binned.v_sigma[0]]),
+        )
+    return prepared
+
+
+def match_model_to_data(prepared_data, model_params, distance_pc, matching_method, loss_method=0,
+                        matching_iterations=MATCHING_ITERATIONS, integration_nodes=INTEGRATION_NODES):
+    """Matched model point for each data point, using the given continuous or integrated matching method"""
+    if matching_method in INTEGRATED_MATCHING_METHODS:
+        return match_integrated_model_to_data(
+            prepared_data, model_params, distance_pc,
+            loss_method=loss_method, integration_nodes=integration_nodes,
+        )
+    return match_continuous_model_to_data(
+        prepared_data, model_params, distance_pc,
+        loss_method=loss_method, matching_iterations=matching_iterations,
+    )
+
+
+def model_curve(model_params, distance_pc, matching_method, npoints=1e6, n_curve_points=1000):
+    """Model curve for plotting, sampled in the same way as the matching method uses it:
+    in radius (to r_low) for legacy/continuous, and in in-plane angle (to the disk midplane) for integrated.
+
+    Returns (ra_model, dec_model, v_model, valid_mask)"""
+    if matching_method in INTEGRATED_MATCHING_METHODS:
+        _, ra_model, dec_model, v_model, _ = integrated_model_nodes(model_params, distance_pc, n_curve_points)
+        return ra_model, dec_model, v_model, jnp.ones_like(ra_model, dtype=bool)
+    ra_model, dec_model, v_model, valid_mask, _ = forward_model(model_params, distance_pc, npoints=npoints)
+    return ra_model, dec_model, v_model, valid_mask.astype(bool)
+
+
 @jax.jit
 def distance_metric_overlap(dmetric_model, model_finite_mask, dmetric_data, data_finite_mask):
     """Compute the overlapping range in the streamline distance metric between data and model"""
@@ -1222,7 +1493,7 @@ def checked_match_model_to_data_curve(*args, **kwargs):
     errors.throw()
     return result
 
-@jax.jit(static_argnames=("loss_method", "matching_method", "matching_iterations", "npoints", "priors_keys", "priors_means", "priors_sigmas"))
+@jax.jit(static_argnames=("loss_method", "matching_method", "matching_iterations", "integration_nodes", "npoints", "priors_keys", "priors_means", "priors_sigmas"))
 def chi2_loss(
     model_params,
     distance_pc,
@@ -1230,6 +1501,7 @@ def chi2_loss(
     loss_method=0,
     matching_method='continuous',
     matching_iterations=MATCHING_ITERATIONS,
+    integration_nodes=INTEGRATION_NODES,
     npoints=1e6,
     priors_keys=(),
     priors_means=(),
@@ -1241,7 +1513,14 @@ def chi2_loss(
     chi2_loss = chi2_data + chi2_priors.
     
     chi2_priors is the sum of Gaussian prior penalty terms for any optimised parameters where priors were given.
-    See compute_prior_penalty"""
+    See compute_prior_penalty
+
+    For the integrated matching methods, chi2_data is the intensity-weighted sum of each data point's integrated
+    loss along the whole model curve (see integrated_match_terms), and the per-coordinate chi2 components are
+    diagnostics that do not sum to chi2_total.
+
+    For the continuous and integrated methods, if the prepared data has an outer_point, chi2_outer (the chi2
+    between the start of the model and the outermost data point, see outer_anchor_chi2) is added to chi2_total."""
  
     loss_method = check_loss_method(loss_method)
     matching_method = check_matching_method(matching_method)
@@ -1358,6 +1637,66 @@ def chi2_loss(
         loss_trace = {'chi2_components': chi2_components, 'matching': matching_trace, 'loss_method': loss_method}
         return chi2_total, loss_trace, None
 
+    if matching_method in INTEGRATED_MATCHING_METHODS:
+        valid = prepared_data.data_finite_mask
+        weights = jnp.where(valid, prepared_data.weights, 0.0)
+        weights_sum = jnp.sum(weights)
+        weights = jnp.where(weights_sum > 0.0, weights / weights_sum, 0.0)
+        point_cloud_loss_scale = prepared_data.point_cloud_loss_scale
+
+        delta_nodes, ra_nodes, dec_nodes, v_nodes, r_nodes = integrated_model_nodes(
+            model_params, distance_pc, integration_nodes
+        )
+        terms = integrated_match_terms(
+            ra_nodes, dec_nodes, v_nodes, delta_nodes,
+            jnp.where(valid, prepared_data.ra_data, 0.0),
+            jnp.where(valid, prepared_data.dec_data, 0.0),
+            jnp.where(valid, prepared_data.v_data, 0.0),
+            jnp.where(valid, prepared_data.ra_sigma, 1.0),
+            jnp.where(valid, prepared_data.dec_sigma, 1.0),
+            jnp.where(valid, prepared_data.v_sigma, 1.0),
+            loss_method=loss_method,
+        )
+        chi2_data = point_cloud_loss_scale * jnp.sum(weights * terms['loss'])
+        component_values = point_cloud_loss_scale * jnp.sum(weights * terms['residual2'], axis=1)
+        chi2_prior = compute_prior_penalty(model_params, priors_means, priors_sigmas, priors_keys)
+        # the start of the model (delta = 0, i.e. r0) is anchored to the outermost data point
+        if prepared_data.outer_point is not None:
+            chi2_outer = outer_anchor_chi2(
+                ra_nodes[0], dec_nodes[0], v_nodes[0],
+                prepared_data.outer_point, prepared_data.outer_sigma, loss_method,
+            )
+        else:
+            chi2_outer = to_float64(0.0)
+        chi2_total = chi2_data + chi2_outer + chi2_prior
+
+        component_keys = LOSS_METHOD_COMPONENT_KEYS[loss_method][:3]
+        chi2_components = {key: value for key, value in zip(component_keys, component_values)}
+        chi2_components.update({'chi2_outer': chi2_outer, 'chi2_prior': chi2_prior, 'chi2_total': chi2_total})
+
+        matched_delta = jnp.where(valid, terms['matched_delta'], jnp.nan)
+        matching_trace = {
+            'data_points_total': prepared_data.ra_data.size,
+            'data_valid_points': jnp.sum(valid),
+            'model_points_total': integration_nodes,
+            'model_valid_points': integration_nodes,
+            'matched_delta_min': jnp.nanmin(matched_delta),
+            'matched_delta_max': jnp.nanmax(matched_delta),
+            'model_radius_min': jnp.min(r_nodes),
+            'model_radius_max': jnp.max(r_nodes),
+            'point_cloud_loss_scale': point_cloud_loss_scale,
+            'integration_nodes': integration_nodes,
+            # weighted mean and max length of the segments carrying each point's integral, in sigma units.
+            # Values above ~1 mean the integral is under-resolved and integration_nodes should be increased
+            'segment_length_mean': jnp.sum(weights * terms['segment_length']),
+            'segment_length_max': jnp.max(jnp.where(valid, terms['segment_length'], 0.0)),
+            # intensity-weighted share of the data lying beyond each end of the model
+            'outer_end_weight': jnp.sum(weights * terms['outer_end_weight']),
+            'inner_end_weight': jnp.sum(weights * terms['inner_end_weight']),
+        }
+        loss_trace = {'chi2_components': chi2_components, 'matching': matching_trace, 'loss_method': loss_method}
+        return chi2_total, loss_trace, None
+
     ra_data = prepared_data.ra_data
     dec_data = prepared_data.dec_data
     v_data = prepared_data.v_data
@@ -1421,13 +1760,24 @@ def chi2_loss(
         chi2_v = point_cloud_loss_scale * jnp.sum(weights * residual_v ** 2)
         chi2_total = chi2_r + chi2_theta + chi2_v
 
+    # the start of the model (r0) is anchored to the outermost data point. The start is evaluated with the closed
+    # form at delta = 0, which is the same point as r = r0 but has no arccos to clip there
+    if prepared_data.outer_point is not None:
+        ra_start, dec_start, v_start, _ = stream_lines_grad.forward_model_at_delta(
+            to_float64(0.0), model_params, distance_pc
+        )
+        chi2_outer = outer_anchor_chi2(
+            ra_start, dec_start, v_start, prepared_data.outer_point, prepared_data.outer_sigma, loss_method,
+        )
+    else:
+        chi2_outer = to_float64(0.0)
     chi2_prior = compute_prior_penalty(model_params, priors_means, priors_sigmas, priors_keys)
-    chi2_total = chi2_total + chi2_prior
+    chi2_total = chi2_total + chi2_outer + chi2_prior
 
     if loss_method == 0:
-        chi2_components = {'chi2_ra': chi2_ra, 'chi2_dec': chi2_dec, 'chi2_v': chi2_v, 'chi2_prior': chi2_prior, 'chi2_total': chi2_total}
+        chi2_components = {'chi2_ra': chi2_ra, 'chi2_dec': chi2_dec, 'chi2_v': chi2_v, 'chi2_outer': chi2_outer, 'chi2_prior': chi2_prior, 'chi2_total': chi2_total}
     else:
-        chi2_components = {'chi2_r': chi2_r, 'chi2_theta': chi2_theta, 'chi2_v': chi2_v, 'chi2_prior': chi2_prior, 'chi2_total': chi2_total}
+        chi2_components = {'chi2_r': chi2_r, 'chi2_theta': chi2_theta, 'chi2_v': chi2_v, 'chi2_outer': chi2_outer, 'chi2_prior': chi2_prior, 'chi2_total': chi2_total}
 
     matching_trace = {
         'data_points_total': ra_data.size,
@@ -1474,6 +1824,8 @@ def evaluate_initial_guess(
     matching_method='continuous',
     matching_iterations=MATCHING_ITERATIONS,
     priors=None,
+    integration_nodes=INTEGRATION_NODES,
+    anchor_outer_point=True,
 ):
     """
     Run the forward model and compute chi2 loss for the initial parameter guess.
@@ -1499,10 +1851,17 @@ def evaluate_initial_guess(
         Loss definition to use. Options:
         - 0: radecvel — RA, Dec, and velocity residuals.
         - 1: rthetavel — radial distance, polar angle, and velocity residuals.
+    matching_method : str
+        One of MATCHING_METHOD_CHOICES. See fit_streamline.
     priors : dict or None
         Optional Gaussian priors on optimised parameters, in the form
         {param_name: (mean, sigma), ...}. Only optimised parameters can have priors.
         Mean and sigma must be in the same canonical units as the rest of the code
+    integration_nodes : int
+        Number of model nodes for the integrated matching methods.
+    anchor_outer_point : bool
+        Continuous and integrated methods: tie the start of the model (r0) to the outermost data point.
+        See fit_streamline.
  
     Returns
     -------
@@ -1520,6 +1879,7 @@ def evaluate_initial_guess(
         - chi2_components    : dict of per-component chi2 values and chi2_total
     """
     loss_method = check_loss_method(loss_method)
+    matching_method = check_matching_method(matching_method)
  
     model_params, opt_params_clean, fixed_params_clean = prepare_model_params(initial_opt_params, fixed_params)
     validated_priors = validate_priors(priors, opt_params_clean, fixed_params_clean)
@@ -1546,17 +1906,13 @@ def evaluate_initial_guess(
             pc_coords=jnp.vstack((data[0], data[1], data[2], jnp.ones_like(data[0]))),
             ra_sigma=uncertainties[0], dec_sigma=uncertainties[1], v_sigma=uncertainties[2],
         )
-        if matching_method == 'continuous':
-            prepared_data = extract_streamline.prepare_binned_continuous_data(
-                pseudo_streamer, n_elements=n_elements
-            )
-        elif matching_method == 'continuous_point_cloud':
-            prepared_data = extract_streamline.prepare_point_cloud_data(pseudo_streamer)
-        else:
-            raise ValueError(f'Unknown matching_method: {matching_method}')
-        matched = match_continuous_model_to_data(
-            prepared_data, model_params, distance_pc,
+        prepared_data = prepare_matching_data(
+            pseudo_streamer, matching_method, n_elements=n_elements, anchor_outer_point=anchor_outer_point
+        )
+        matched = match_model_to_data(
+            prepared_data, model_params, distance_pc, matching_method,
             loss_method=loss_method, matching_iterations=matching_iterations,
+            integration_nodes=integration_nodes,
         )
         ra_model_interp = matched.ra_model_matched
         dec_model_interp = matched.dec_model_matched
@@ -1567,6 +1923,7 @@ def evaluate_initial_guess(
         model_params, distance_pc, prepared_data, loss_method=loss_method,
         matching_method=matching_method,
         matching_iterations=matching_iterations,
+        integration_nodes=integration_nodes,
         priors_keys=priors_keys, priors_means=priors_means, priors_sigmas=priors_sigmas
     )
     chi2_components = loss_trace['chi2_components']
@@ -1595,6 +1952,8 @@ def fit_streamline(initial_opt_params, fixed_params, streamer, distance_pc,
                    loss_method=1, # 0: radecvel, 1: rthetavel
                    matching_method='continuous',
                    matching_iterations=MATCHING_ITERATIONS,
+                   integration_nodes=INTEGRATION_NODES,
+                   anchor_outer_point=True,
                    priors=None,
                    v_lsr=None,
                    show_plots=False,
@@ -1654,6 +2013,23 @@ def fit_streamline(initial_opt_params, fixed_params, streamer, distance_pc,
         - 0: radecvel: optimise RA, Dec, and velocity residuals.
         - 1: rthetavel: optimise projected radial distance, polar angle, and velocity residuals.
         Both options use the same model-data matching and overlap penalty.
+    matching_method : str
+        How the model is compared to the data. Options:
+        - 'continuous': binned data, each bin matched to its closest model radius by golden-section search.
+        - 'continuous_point_cloud': as 'continuous', using every point in the point cloud.
+        - 'integrated': binned data, each bin's likelihood integrated along the whole model curve, so no
+          single matched point is chosen and the loss is smooth in every parameter. The model runs from r0 to
+          the disk midplane and rmin/deltar are not used. See integrated_match_terms.
+        - 'integrated_point_cloud': as 'integrated', using every point in the point cloud.
+        - 'legacy': binned data matched to a sampled model by the sky-plane distance metric.
+    integration_nodes : int
+        Number of model nodes for the integrated methods. Increase it if the fit warns that the
+        integral is under-resolved.
+    anchor_outer_point : bool
+        Continuous and integrated methods (not legacy). If True, add chi2_outer: the chi2 between the start of the
+        model (r0) and the outermost metric bin of the data. Neither loss penalises model length beyond the data,
+        so without this r0 is weakly constrained from above. It assumes the observed outer end of the streamer is
+        where the streamline starts; set False if the emission may be cut off by the field of view or sensitivity.
     priors : dict or None
         Optional Gaussian priors on optimised parameters, in the form
         {param_name: (mean, sigma), ...}. Only optimised parameters can have priors.
@@ -1752,20 +2128,19 @@ def fit_streamline(initial_opt_params, fixed_params, streamer, distance_pc,
     opt_state = solver.init(opt_params_norm)
 
     # Precompute data-only quantities once before optimisation loop
-    if matching_method == 'continuous':
-        prepared_data = extract_streamline.prepare_binned_continuous_data(
-            streamer, n_elements=len(data[0])
-        )
-    elif matching_method == 'continuous_point_cloud':
-        prepared_data = extract_streamline.prepare_point_cloud_data(
+    if matching_method == 'legacy':
+        prepared_data = extract_streamline.prepare_data(data, uncertainties, n_elements=len(data[0]))
+    else:
+        prepared_data = prepare_matching_data(
             streamer,
+            matching_method,
+            n_elements=len(data[0]),
             point_sigma_ra=point_sigma_ra,
             point_sigma_dec=point_sigma_dec,
             point_sigma_v=point_sigma_v,
             point_cloud_loss_scale=point_cloud_loss_scale,
+            anchor_outer_point=anchor_outer_point,
         )
-    else:
-        prepared_data = extract_streamline.prepare_data(data, uncertainties, n_elements=len(data[0]))
     # npoints for forward model evaluation: fixed large number set by max r0 bound and deltar
     # this is necessary to ensure forward model has constant array lengths for jax/jit compatability
     if 'r0' in param_bounds:
@@ -1788,6 +2163,7 @@ def fit_streamline(initial_opt_params, fixed_params, streamer, distance_pc,
             loss_method=loss_method,
             matching_method=matching_method,
             matching_iterations=matching_iterations,
+            integration_nodes=integration_nodes,
             npoints=npoints,
             priors_keys=priors_keys,
             priors_means=priors_means,
@@ -2059,6 +2435,16 @@ def fit_streamline(initial_opt_params, fixed_params, streamer, distance_pc,
     print(f"Optimisation complete!")
     print(f"Best-fit parameters found at epoch: {best_epoch}, with loss: {best_loss:.6f}")
 
+    if matching_method in INTEGRATED_MATCHING_METHODS:
+        _, (best_trace, _) = loss_from_normalised(best_opt_params_norm)
+        segment_length_max = float(best_trace['matching']['segment_length_max'])
+        if segment_length_max > INTEGRATION_RESOLUTION_WARN:
+            print(
+                f"WARNING: the integrated loss is under-resolved at the best fit: model segments near some data "
+                f"points are {segment_length_max:.2g} sigma long (should be < {INTEGRATION_RESOLUTION_WARN:g}). "
+                f"Increase integration_nodes (currently {integration_nodes})."
+            )
+
     # compute errors on best-fit parameters
     print("\nEstimating parameter uncertainties from Hessian...")
     param_errors = None
@@ -2075,6 +2461,7 @@ def fit_streamline(initial_opt_params, fixed_params, streamer, distance_pc,
             loss_method=loss_method,
             matching_method=matching_method,
             matching_iterations=matching_iterations,
+            integration_nodes=integration_nodes,
             gradient_tol=gradient_tol,
             normalisation_spec=normalisation_spec,
             best_norm_opt_params=best_opt_params_norm,
@@ -2152,6 +2539,7 @@ def fit_streamline(initial_opt_params, fixed_params, streamer, distance_pc,
             transformed_cov_result=cov_transformed_dict,
             matching_method=matching_method,
             matching_iterations=matching_iterations,
+            integration_nodes=integration_nodes,
         )
 
     # save results to CovarianceResult and FitResult namedtuples

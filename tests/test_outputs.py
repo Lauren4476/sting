@@ -1126,13 +1126,14 @@ def test_by_epoch_prepares_once_and_saves_incrementally(
         _gd, "sanitize_param_partition", lambda fixed, initial, require_nonempty_opt=False: (fixed, initial)
     )
     monkeypatch.setattr(
-        outputs_module.extract_streamline,
-        "prepare_binned_continuous_data",
-        lambda supplied_streamer, n_elements: prepare_calls.append((supplied_streamer, n_elements)) or prepared,
+        _gd,
+        "prepare_matching_data",
+        lambda supplied_streamer, matching_method, n_elements=None: prepare_calls.append((supplied_streamer, matching_method)) or prepared,
+        raising=False,
     )
 
     def fake_evaluate(model_params, distance, supplied_streamer, matching_method,
-                      matching_iterations, prepared=None):
+                      matching_iterations, prepared=None, integration_nodes=None):
         assert output_dir.is_dir()
         assert prepared is not None
         events.append(("evaluate", model_params["r0"]))
@@ -1171,5 +1172,5 @@ def test_by_epoch_prepares_once_and_saves_incrementally(
         **extra_kwargs,
     )
 
-    assert prepare_calls == [(streamer, len(streamer.ra_data))]
+    assert prepare_calls == [(streamer, "continuous")]
     assert events == [("evaluate", 10.0), ("plot", 0), ("evaluate", 11.0), ("plot", 1)]

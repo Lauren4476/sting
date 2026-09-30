@@ -36,7 +36,10 @@ PreparedContinuousData = namedtuple('PreparedContinuousData', [
     'r_proj_data', 'theta_proj_data',
     'valid_points', 'total_points',
     'bin_intensity', 'bin_count',
-])
+    # optional anchor for the start of the model (integrated methods): the outermost data point
+    # as (ra, dec, v) and its (ra, dec, v) uncertainties. None means no anchor
+    'outer_point', 'outer_sigma',
+], defaults=(None, None))
 
 # Compatibility name for callers of the original raw point-cloud helper.
 PreparedPointCloudData = PreparedContinuousData

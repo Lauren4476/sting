@@ -266,6 +266,7 @@ def estimate_parameter_errors(
     loss_method=0,
     matching_method='legacy',
     matching_iterations=gradient_descent.MATCHING_ITERATIONS,
+    integration_nodes=gradient_descent.INTEGRATION_NODES,
     gradient_tol=1e-1,
     normalisation_spec=None,
     best_norm_opt_params=None,
@@ -356,7 +357,7 @@ def estimate_parameter_errors(
         norm_params = vector_to_params_dict(theta_norm_vec, norm_keys)
         physical_params = gradient_descent.denormalise_opt_params(norm_params, normalisation_spec)
         model_params = {**physical_params, **fixed_params}
-        if matching_method in ('continuous', 'continuous_point_cloud'):
+        if matching_method != 'legacy':
             chi2_total, _, _ = gradient_descent.chi2_loss(
                 model_params,
                 distance_pc,
@@ -364,6 +365,7 @@ def estimate_parameter_errors(
                 loss_method=loss_method,
                 matching_method=matching_method,
                 matching_iterations=matching_iterations,
+                integration_nodes=integration_nodes,
                 npoints=npoints,
                 priors_keys=priors_keys,
                 priors_means=priors_means,
@@ -387,7 +389,7 @@ def estimate_parameter_errors(
     def loss_vec(theta_vec):
         params = vector_to_params_dict(theta_vec, keys)
         model_params = {**params, **fixed_params}
-        if matching_method in ('continuous', 'continuous_point_cloud'):
+        if matching_method != 'legacy':
             chi2_total, _, _ = gradient_descent.chi2_loss(
                 model_params,
                 distance_pc,
@@ -395,6 +397,7 @@ def estimate_parameter_errors(
                 loss_method=loss_method,
                 matching_method=matching_method,
                 matching_iterations=matching_iterations,
+                integration_nodes=integration_nodes,
                 npoints=npoints,
                 priors_keys=priors_keys,
                 priors_means=priors_means,
@@ -434,6 +437,7 @@ def estimate_parameter_errors(
                 loss_method=loss_method,
                 matching_method=matching_method,
                 matching_iterations=matching_iterations,
+                integration_nodes=integration_nodes,
                 priors_keys=priors_keys,
                 priors_means=priors_means,
                 priors_sigmas=priors_sigmas

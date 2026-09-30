@@ -410,6 +410,111 @@ def evaluate_streamline_at_radius(r, mass, r0, theta0, phi0, mu, v_r0, inc, pa):
     return (rotated_x, rotated_y, rotated_z), (rotated_v_x, rotated_v_y, rotated_v_z), r_valid
 
 @jax.jit
+def evaluate_streamline_at_delta(delta, mass, r0, theta0, phi0, mu, v_r0, inc, pa):
+    '''Evaluate the Mendoza streamline in closed form at in-plane angle delta.
+
+    delta is the angle travelled within the orbital plane since r0, i.e. delta = orb_ang - orb_ang0
+    (varphi - varphi_0 in Mendoza+2009). delta = 0 is the start of the streamline at r0, and
+    delta = pi/2 is where the streamline reaches the disk midplane (z = 0 before rotation).
+
+    This is algebraically identical to evaluate_streamline_at_radius, but uses no arccos, tan or
+    safe-epsilon clipping, so it is smooth in every parameter at every delta. See docs/integrated_matching.tex
+    for the derivation. With s = sin(theta0):
+        1 - e cos(orb_ang) = 1 - (1 - mu s^2) cos(delta) + nu s sin(delta)
+        e sin(orb_ang)     = nu s cos(delta) + (1 - mu s^2) sin(delta)
+        r = rc s^2 / (1 - e cos(orb_ang))
+        position = r n,  velocity = (vk0 / s) (-e sin(orb_ang) n + (1 - e cos(orb_ang)) t)
+    where n and t are the radial and tangential unit vectors in the orbital plane.
+
+    :return: (x, y, z) in au, (v_x, v_y, v_z) in km/s, both rotated onto the sky, and r in au
+    '''
+    delta = jnp.asarray(delta, dtype=FLOAT_DTYPE)
+    stream_state = build_stream_quantities(mass=mass, r0=r0, theta0=theta0, mu=mu, v_r0=v_r0)
+    rc = stream_state.rc
+    nu = stream_state.nu
+    vk0 = stream_state.vk0
+
+    sin_theta0 = jnp.sin(theta0)
+    cos_theta0 = jnp.cos(theta0)
+    cos_delta = jnp.cos(delta)
+    sin_delta = jnp.sin(delta)
+
+    # e cos(orb_ang0) and e sin(orb_ang0), as in build_stream_quantities
+    ecc_cos_orb_ang0 = 1.0 - stream_state.mu * jnp.power(sin_theta0, 2)
+    ecc_sin_orb_ang0 = nu * sin_theta0
+    # angle-addition expansions of 1 - e cos(orb_ang) and e sin(orb_ang)
+    one_minus_ecos = 1.0 - ecc_cos_orb_ang0 * cos_delta + ecc_sin_orb_ang0 * sin_delta
+    ecc_sin = ecc_sin_orb_ang0 * cos_delta + ecc_cos_orb_ang0 * sin_delta
+
+    r = rc * jnp.power(sin_theta0, 2) / one_minus_ecos
+
+    # radial (n) and tangential (t) unit vectors in the orbital plane, before rotating by phi0.
+    # The orbital plane contains the start point (theta0, phi0) and the initial azimuthal direction.
+    n_x = sin_theta0 * cos_delta
+    n_y = sin_delta
+    n_z = cos_theta0 * cos_delta
+    t_x = -sin_theta0 * sin_delta
+    t_y = cos_delta
+    t_z = -cos_theta0 * sin_delta
+
+    # rotate about the z-axis by phi0
+    cos_phi0 = jnp.cos(phi0)
+    sin_phi0 = jnp.sin(phi0)
+    n_x, n_y = cos_phi0 * n_x - sin_phi0 * n_y, sin_phi0 * n_x + cos_phi0 * n_y
+    t_x, t_y = cos_phi0 * t_x - sin_phi0 * t_y, sin_phi0 * t_x + cos_phi0 * t_y
+
+    x = r * n_x
+    y = r * n_y
+    z = r * n_z
+
+    v_n = -vk0 * ecc_sin / sin_theta0  # radial velocity, v_r
+    v_t = vk0 * one_minus_ecos / sin_theta0  # tangential speed, h / r
+    v_x = v_n * n_x + v_t * t_x
+    v_y = v_n * n_y + v_t * t_y
+    v_z = v_n * n_z + v_t * t_z
+
+    rotation_matrix = build_rotation_matrix(inc, pa)
+    rotated_x, rotated_y, rotated_z = rotate_xyz(x, y, z, rotation_matrix=rotation_matrix)
+    rotated_v_x, rotated_v_y, rotated_v_z = rotate_xyz(v_x, v_y, v_z, rotation_matrix=rotation_matrix)
+
+    return (rotated_x, rotated_y, rotated_z), (rotated_v_x, rotated_v_y, rotated_v_z), r
+
+
+def mu_from_model_params(model_params):
+    '''Get mu = rc/r0 from whichever of 'mu', 'rc' or 'omega' is in model_params'''
+    if 'mu' in model_params:
+        return model_params['mu']
+    if 'rc' in model_params:
+        return model_params['rc'] / model_params['r0']
+    if 'omega' in model_params:
+        return mu_from_omega(omega=model_params['omega'], mass=model_params['mass'], r0=model_params['r0'])
+    raise ValueError("model_params must contain either 'rc', 'omega', or 'mu'")
+
+
+@jax.jit
+def forward_model_at_delta(delta, model_params, distance_pc):
+    '''Evaluate the closed-form streamline at in-plane angles delta (see evaluate_streamline_at_delta),
+    returning RA offset (arcsec), Dec offset (arcsec), velocity (km/s) and radius (au), in the
+    same conventions as forward_model_at_radius().'''
+    distance_pc = jnp.asarray(distance_pc, dtype=FLOAT_DTYPE)
+    (x, y, z), (vx, vy, vz), r = evaluate_streamline_at_delta(
+        delta=delta,
+        mass=model_params['mass'],
+        r0=model_params['r0'],
+        theta0=model_params['theta0'],
+        phi0=model_params['phi0'],
+        mu=mu_from_model_params(model_params),
+        v_r0=model_params['v_r0'],
+        inc=model_params['inc'],
+        pa=model_params['pa'],
+    )
+    ra_model = -x / distance_pc
+    dec_model = z / distance_pc
+    v_model = vy + model_params['v_lsr']
+    return ra_model, dec_model, v_model, r
+
+
+@jax.jit
 def forward_model_at_radius(r, model_params, distance_pc):
     '''Evaluate the analytic streamline model at arbitrary radii, returning sky-plane
     offsets and velocity in the same conventions as forward_model().'''

@@ -59,6 +59,7 @@ def evaluate_best_fit(
     streamer=None,
     matching_method='legacy',
     matching_iterations=gradient_descent.MATCHING_ITERATIONS,
+    integration_nodes=gradient_descent.INTEGRATION_NODES,
 ):
     """
     Run the forward model and match it to data for the best-fit parameters. Optionally run a by-eye parameter set through the forward model 
@@ -84,8 +85,9 @@ def evaluate_best_fit(
     ra_data, dec_data, _ = data
  
     best_opt_full_params, _, _ = gradient_descent.prepare_model_params(best_opt_params, fixed_params)
-    ra_best, dec_best, v_best, valid_mask_best, _err = gradient_descent.forward_model(best_opt_full_params, distance_pc)
-    valid_mask_best = valid_mask_best.astype(bool)
+    ra_best, dec_best, v_best, valid_mask_best = gradient_descent.model_curve(
+        best_opt_full_params, distance_pc, matching_method
+    )
  
     if matching_method == 'legacy':
         ra_best_interp, dec_best_interp, v_best_interp, valid_interp, _, _, _ = (
@@ -97,18 +99,13 @@ def evaluate_best_fit(
         )
     else:
         if streamer is None:
-            raise ValueError('streamer is required for continuous best-fit evaluation.')
-        if matching_method == 'continuous':
-            prepared = extract_streamline.prepare_binned_continuous_data(
-                streamer, n_elements=len(streamer.data[0])
-            )
-        elif matching_method == 'continuous_point_cloud':
-            prepared = extract_streamline.prepare_point_cloud_data(streamer)
-        else:
-            raise ValueError(f'Unknown matching_method: {matching_method}')
-        matched = gradient_descent.match_continuous_model_to_data(
-            prepared, best_opt_full_params, distance_pc,
-            matching_iterations=matching_iterations,
+            raise ValueError('streamer is required for continuous or integrated best-fit evaluation.')
+        prepared = gradient_descent.prepare_matching_data(
+            streamer, matching_method, n_elements=len(streamer.data[0])
+        )
+        matched = gradient_descent.match_model_to_data(
+            prepared, best_opt_full_params, distance_pc, matching_method,
+            matching_iterations=matching_iterations, integration_nodes=integration_nodes,
         )
         ra_best_interp = matched.ra_model_matched
         dec_best_interp = matched.dec_model_matched
@@ -124,8 +121,9 @@ def evaluate_best_fit(
     by_eye = None
     if by_eye_params is not None:
         by_eye_full_params, _, _ = gradient_descent.prepare_model_params(by_eye_params, fixed_params)
-        ra_by_eye, dec_by_eye, v_by_eye, valid_mask_by_eye, err_by_eye = gradient_descent.forward_model(by_eye_full_params, distance_pc)
-        err_by_eye.throw()
+        ra_by_eye, dec_by_eye, v_by_eye, valid_mask_by_eye = gradient_descent.model_curve(
+            by_eye_full_params, distance_pc, matching_method
+        )
         ra_by_eye, dec_by_eye, v_by_eye = _mask_model_arrays(
             valid_mask_by_eye, ra_by_eye, dec_by_eye, v_by_eye
         )
@@ -159,6 +157,7 @@ def plot_fitting_results(
     by_eye_params=None,
     matching_method='legacy',
     matching_iterations=gradient_descent.MATCHING_ITERATIONS,
+    integration_nodes=gradient_descent.INTEGRATION_NODES,
 ):
     """
     Generate and save the followingbest-fit diagnostic plots to save_folderafter optimisation:
@@ -197,6 +196,7 @@ def plot_fitting_results(
         ordered_best_opt_params, fixed_params, streamer.data, distance_pc,
         by_eye_params=by_eye_params, streamer=streamer,
         matching_method=matching_method, matching_iterations=matching_iterations,
+        integration_nodes=integration_nodes,
     )
 
     plot_morphology(
@@ -414,12 +414,12 @@ def make_morphology_background(pc_coords, metric_boundaries, ra_lim, dec_lim, fi
 
 
 def _evaluate_epoch_match(model_params, distance, streamer, matching_method,
-                          matching_iterations, prepared=None):
+                          matching_iterations, prepared=None,
+                          integration_nodes=gradient_descent.INTEGRATION_NODES):
     """Return model values matched by the same method used during fitting."""
-    ra_model, dec_model, v_model, valid_mask_model, err = gradient_descent.forward_model(
-        model_params, distance
+    ra_model, dec_model, v_model, valid_mask_model = gradient_descent.model_curve(
+        model_params, distance, matching_method
     )
-    valid_mask_model = valid_mask_model.astype(bool)
     if matching_method == 'legacy':
         return (
             ra_model, dec_model, v_model, valid_mask_model,
@@ -428,19 +428,11 @@ def _evaluate_epoch_match(model_params, distance, streamer, matching_method,
                 streamer.ra_data, streamer.dec_data,
             )[:4],
         )
-    if matching_method == 'continuous':
-        if prepared is None:
-            prepared = extract_streamline.prepare_binned_continuous_data(
-                streamer, n_elements=len(streamer.ra_data)
-            )
-    elif matching_method == 'continuous_point_cloud':
-        if prepared is None:
-            prepared = extract_streamline.prepare_point_cloud_data(streamer)
-    else:
-        raise ValueError(f'Unknown matching_method: {matching_method}')
-    matched = gradient_descent.match_continuous_model_to_data(
-        prepared, model_params, distance,
-        matching_iterations=matching_iterations,
+    if prepared is None:
+        prepared = gradient_descent.prepare_matching_data(streamer, matching_method)
+    matched = gradient_descent.match_model_to_data(
+        prepared, model_params, distance, matching_method,
+        matching_iterations=matching_iterations, integration_nodes=integration_nodes,
     )
     return (
         ra_model, dec_model, v_model, valid_mask_model,
@@ -459,6 +451,7 @@ def plot_morphology_by_epoch(
     make_video=False,
     matching_method='continuous',
     matching_iterations=gradient_descent.MATCHING_ITERATIONS,
+    integration_nodes=gradient_descent.INTEGRATION_NODES,
 ):
     """
     Create and save one streamline morphology plot per optimisation epoch, in save_folder/epochs/morphology,
@@ -479,14 +472,7 @@ def plot_morphology_by_epoch(
     output_dir = os.path.join(save_folder, "epochs", "morphology")
     _ensure_clean_dir(output_dir)
 
-    if matching_method == 'continuous':
-        prepared = extract_streamline.prepare_binned_continuous_data(
-            streamer, n_elements=len(streamer.ra_data)
-        )
-    elif matching_method == 'continuous_point_cloud':
-        prepared = extract_streamline.prepare_point_cloud_data(streamer)
-    else:
-        prepared = None
+    prepared = gradient_descent.prepare_matching_data(streamer, matching_method)
 
     # get constant axis limits
     all_ra = np.concatenate([
@@ -521,7 +507,7 @@ def plot_morphology_by_epoch(
         (ra_model, dec_model, v_model, valid_mask_model,
          ra_model_interp, dec_model_interp, _, valid) = _evaluate_epoch_match(
             model_params_epoch, distance, streamer, matching_method,
-            matching_iterations, prepared=prepared
+            matching_iterations, prepared=prepared, integration_nodes=integration_nodes,
         )
         ra_model, dec_model, v_model = _mask_model_arrays(
             valid_mask_model, ra_model, dec_model, v_model
@@ -716,6 +702,7 @@ def plot_ra_vel_by_epoch(
     make_video=False,
     matching_method='continuous',
     matching_iterations=gradient_descent.MATCHING_ITERATIONS,
+    integration_nodes=gradient_descent.INTEGRATION_NODES,
 ):
     """
     Create RA–velocity plots for every epoch
@@ -735,14 +722,7 @@ def plot_ra_vel_by_epoch(
     output_dir = os.path.join(save_folder, "epochs", "ra_vel")
     _ensure_clean_dir(output_dir)
 
-    if matching_method == 'continuous':
-        prepared = extract_streamline.prepare_binned_continuous_data(
-            streamer, n_elements=len(streamer.ra_data)
-        )
-    elif matching_method == 'continuous_point_cloud':
-        prepared = extract_streamline.prepare_point_cloud_data(streamer)
-    else:
-        prepared = None
+    prepared = gradient_descent.prepare_matching_data(streamer, matching_method)
 
     # global velocity limits
     v_list = [streamer.v_data, streamer.pc_coords[2]]
@@ -762,7 +742,7 @@ def plot_ra_vel_by_epoch(
         (ra_model, dec_model, v_model, valid_mask_model,
          ra_model_interp, _, v_model_interp, valid) = _evaluate_epoch_match(
             model_params_epoch, distance, streamer, matching_method,
-            matching_iterations, prepared=prepared
+            matching_iterations, prepared=prepared, integration_nodes=integration_nodes,
         )
         ra_model, dec_model, v_model = _mask_model_arrays(
             valid_mask_model, ra_model, dec_model, v_model
@@ -873,6 +853,7 @@ def plot_dec_vel_by_epoch(
     make_video=False,
     matching_method='continuous',
     matching_iterations=gradient_descent.MATCHING_ITERATIONS,
+    integration_nodes=gradient_descent.INTEGRATION_NODES,
 ):
     """
     Create DEC–velocity plots for every epoch
@@ -892,14 +873,7 @@ def plot_dec_vel_by_epoch(
     output_dir = os.path.join(save_folder, "epochs", "dec_vel")
     _ensure_clean_dir(output_dir)
 
-    if matching_method == 'continuous':
-        prepared = extract_streamline.prepare_binned_continuous_data(
-            streamer, n_elements=len(streamer.ra_data)
-        )
-    elif matching_method == 'continuous_point_cloud':
-        prepared = extract_streamline.prepare_point_cloud_data(streamer)
-    else:
-        prepared = None
+    prepared = gradient_descent.prepare_matching_data(streamer, matching_method)
 
     # global velocity limits
     v_list = [streamer.v_data, streamer.pc_coords[2]]
@@ -919,7 +893,7 @@ def plot_dec_vel_by_epoch(
         (ra_model, dec_model, v_model, valid_mask_model,
          ra_model_interp, dec_model_interp, v_model_interp, valid) = _evaluate_epoch_match(
             model_params_epoch, distance, streamer, matching_method,
-            matching_iterations, prepared=prepared
+            matching_iterations, prepared=prepared, integration_nodes=integration_nodes,
         )
         ra_model, dec_model, v_model = _mask_model_arrays(
             valid_mask_model, ra_model, dec_model, v_model
@@ -1336,6 +1310,7 @@ def plot_vel_radius_by_epoch(
     make_video=False,
     matching_method='continuous',
     matching_iterations=gradient_descent.MATCHING_ITERATIONS,
+    integration_nodes=gradient_descent.INTEGRATION_NODES,
 ):
     """Create velocity vs projected radius plots for every epoch."""
 
@@ -1354,14 +1329,7 @@ def plot_vel_radius_by_epoch(
     output_dir = os.path.join(save_folder, "epochs", "vel_radius")
     _ensure_clean_dir(output_dir)
 
-    if matching_method == 'continuous':
-        prepared = extract_streamline.prepare_binned_continuous_data(
-            streamer, n_elements=len(streamer.ra_data)
-        )
-    elif matching_method == 'continuous_point_cloud':
-        prepared = extract_streamline.prepare_point_cloud_data(streamer)
-    else:
-        prepared = None
+    prepared = gradient_descent.prepare_matching_data(streamer, matching_method)
 
     kde_background = None
     if streamer is not None:
@@ -1395,7 +1363,7 @@ def plot_vel_radius_by_epoch(
         (ra_model, dec_model, v_model, valid_mask_model,
          ra_model_interp, dec_model_interp, v_model_interp, valid) = _evaluate_epoch_match(
             model_params_epoch, distance, streamer, matching_method,
-            matching_iterations, prepared=prepared
+            matching_iterations, prepared=prepared, integration_nodes=integration_nodes,
         )
         ra_model, dec_model, v_model = _mask_model_arrays(
             valid_mask_model, ra_model, dec_model, v_model
