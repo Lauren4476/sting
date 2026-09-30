@@ -1551,6 +1551,18 @@ def plot_streamline_covariance_samples(best_opt_params,
     cov_opt_keys = covariance_result.opt_keys
     cov_fixed_params = covariance_result.fixed_params
     cov = covariance_result.covariance
+
+    # NaN or negative variances mean the Hessian wasn't positive definite at the best fit.
+    # multivariate_normal would silently use |variance| there, giving meaningless samples.
+    variances = np.diag(np.asarray(cov, dtype=float))
+    invalid_keys = [key for key, var in zip(cov_opt_keys, variances) if not (var >= 0.0)]
+    if invalid_keys:
+        print(
+            f"WARNING: skipping covariance sampling plot, since the variances of {invalid_keys} are NaN or negative. "
+            "The loss is flat or not at a minimum in some direction, so the covariance matrix is not valid to sample from."
+        )
+        return
+
     _, streamline_samples = generate_streamline_samples(
         best_opt_params=cov_best_params,
         covariance=cov,

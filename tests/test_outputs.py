@@ -516,6 +516,32 @@ class TestPlotParamUncertainties:
 
 
 # ===========================================================================
+# plot_streamline_covariance_samples – invalid covariance guard
+# ===========================================================================
+
+class TestCovarianceSamplesGuard:
+    def _cov_result(self, cov):
+        return types.SimpleNamespace(
+            best_opt_params={"r0": 1000.0, "v_r0": 0.01, "pa": 3.0},
+            opt_keys=["r0", "v_r0", "pa"],
+            fixed_params={},
+            covariance=np.asarray(cov, dtype=float),
+        )
+
+    @pytest.mark.parametrize("bad_var", [float("nan"), -652.0])
+    def test_skips_and_warns_on_invalid_variance(self, tmp_path, capsys, bad_var):
+        cov = np.diag([100.0, bad_var, 0.01])
+        result = outputs_module.plot_streamline_covariance_samples(
+            {}, {}, None, None, 293.0, self._cov_result(cov), save_folder=str(tmp_path),
+        )
+        assert result is None
+        out = capsys.readouterr().out
+        assert "skipping covariance sampling plot" in out
+        assert "v_r0" in out and "r0'" not in out.replace("v_r0", "")
+        assert not (tmp_path / "streamline_covariance_samples.png").exists()
+
+
+# ===========================================================================
 # plot_param_correlations 
 # ===========================================================================
 
