@@ -270,6 +270,7 @@ def estimate_parameter_errors(
     normalisation_spec=None,
     best_norm_opt_params=None,
     rotation_key=None,
+    active_bounds=None,
     npoints=10000,
     priors_keys=(),
     priors_means=(),
@@ -295,13 +296,19 @@ def estimate_parameter_errors(
         If not provided, will be computed from best_opt_params and normalisation_spec, but providing it can save a redundant computation
     rotation_key : str or None
         If provided, must be 'rc' or 'omega'. Used to transform covariance matrix from optimised 'mu' to rotation_key
+    active_bounds : dict or None
+        {param key: 'lower' or 'upper'} for parameters at a bound with the gradient pushing past it
+        (see gradient_descent.find_active_bounds). The best fit is not a stationary point in these parameters,
+        so the Hessian doesn't describe them. They are held fixed: the other parameters' covariance is
+        2x the inverse of the Hessian with their rows/columns removed (i.e. conditional on them), they get zero
+        variance in the returned covariance, and they are left out of the error dicts.
     priors_keys, priors_means, priors_sigmas : tuples
         Parallel tuples of prior information for optimised parameters. If provided, a prior penalty is added to the chi2 loss before computing the Hessian. If not provided, no prior penalty is added.
 
     Returns
     -------
     dict
-        1-sigma uncertainties for each optimisable parameter
+        1-sigma uncertainties for each optimisable parameter (except those in active_bounds)
     array
         covariance matrix
     dict or None
@@ -321,18 +328,8 @@ def estimate_parameter_errors(
         raise ValueError("normalisation_spec not provided")
     
 
-    # evaluate hessian in raw_v_r0 space (v_r0 = softplus(raw_v_r0))
-    has_v_r0 = 'v_r0' in best_opt_params
-    params_for_hessian = dict(best_opt_params)
-    if has_v_r0:
-        v_r0_best = gradient_descent.to_float64(params_for_hessian['v_r0'])
-        if not bool(v_r0_best > 0): #should never be triggered
-            raise ValueError(f"best fit v_r0 must be positive, got v_r0={v_r0_best}")
-        params_for_hessian['v_r0'] = gradient_descent.inv_softplus(v_r0_best)
-
-
     # convert dict -> vector
-    params_vec, keys = params_dict_to_vector(params_for_hessian)
+    params_vec, keys = params_dict_to_vector(best_opt_params)
     loss_method = gradient_descent.check_loss_method(loss_method)
     matching_method = gradient_descent.check_matching_method(matching_method)
 
@@ -349,7 +346,7 @@ def estimate_parameter_errors(
         norm_opt_params = gradient_descent.normalise_opt_params(best_opt_params, normalisation_spec)
 
     norm_params_vec, norm_keys = params_dict_to_vector(norm_opt_params)
-    missing_norm_keys = [key for key in keys if key not in normalisation_spec and key != 'v_r0']
+    missing_norm_keys = [key for key in keys if key not in normalisation_spec]
     if missing_norm_keys:
         raise ValueError(
             f"normalisation_spec is missing optimised parameter keys required: {missing_norm_keys} "
@@ -389,9 +386,6 @@ def estimate_parameter_errors(
     
     def loss_vec(theta_vec):
         params = vector_to_params_dict(theta_vec, keys)
-        if has_v_r0:
-            params = dict(params)
-            params['v_r0'] = gradient_descent.softplus(params['v_r0'])
         model_params = {**params, **fixed_params}
         if matching_method in ('continuous', 'continuous_point_cloud'):
             chi2_total, _, _ = gradient_descent.chi2_loss(
@@ -423,6 +417,10 @@ def estimate_parameter_errors(
     
 
     
+    active_bounds = {} if active_bounds is None else active_bounds
+    free_mask = jnp.array([key not in active_bounds for key in norm_keys])
+    free_idx = jnp.flatnonzero(free_mask)
+
     # Check gradient magnitude at best-fit parameters in normalised space.
     if gradient_tol is not None:
         def norm_loss_vec(theta_norm_vec):
@@ -443,7 +441,8 @@ def estimate_parameter_errors(
             return chi2_total        
 
         norm_grad_vec = jax.grad(norm_loss_vec)(norm_params_vec)
-        
+        # parameters held at a bound can't reach zero gradient, so leave them out of the check
+        norm_grad_vec = jnp.where(free_mask, norm_grad_vec, 0.0)
         norm_grad_norm = float(gradient_descent.gradient_l2_norm(norm_grad_vec))
 
         if norm_grad_norm > gradient_tol:
@@ -460,39 +459,36 @@ def estimate_parameter_errors(
     # compute Hessian in normalised space
     H_norm = jax.hessian(loss_vec_norm)(norm_params_vec)
 
-    # invert to get covariance in normalised space
-    cov_norm = jnp.linalg.inv(H_norm)
+    # invert to get covariance in normalised space, holding parameters at an active bound fixed
+    # (zero variance, and the others conditional on them).
+    # The loss is chi2 = -2 ln L, so the inverse covariance is the Hessian of -ln L = H/2, i.e. cov = 2 H^-1
+    H_free = H_norm[jnp.ix_(free_idx, free_idx)]
+    cov_norm = jnp.zeros_like(H_norm).at[jnp.ix_(free_idx, free_idx)].set(2.0 * jnp.linalg.inv(H_free))
 
     # transform from normalised space to physical space
     def denormalise_vec(theta_norm_vec):
         norm_params = vector_to_params_dict(theta_norm_vec, norm_keys)
         physical_params = gradient_descent.denormalise_opt_params(norm_params, normalisation_spec)
-        # denormalise_opt_params returns v_r0 already passed through softplus - convert back to raw space here so that J is correct for the transformation from raw_v_r0 to v_r0
-        if has_v_r0:
-            physical_params = dict(physical_params)
-            physical_params['v_r0'] = gradient_descent.inv_softplus(physical_params['v_r0'])
         output = [physical_params[k] for k in keys]
         return jnp.stack(output)
     
     J = jax.jacobian(denormalise_vec)(norm_params_vec)
     cov = J @ cov_norm @ J.T
-    
-    if has_v_r0:
-        v_r0_transformed = transform_cov_matrix(cov, keys, best_opt_params, fixed_params, rotation_key=None, v_r0_is_raw=True)
-        cov = v_r0_transformed['cov']
 
     # parameter errors
     errors = jnp.sqrt(jnp.diag(cov))
 
-    error_dict = {k: float(errors[i]) for i, k in enumerate(keys)}
+    error_dict = {k: float(errors[i]) for i, k in enumerate(keys) if k not in active_bounds}
 
     cov_transformed_dict = None
     if rotation_key is not None and 'mu' in keys:
         cov_transformed_dict = transform_cov_matrix(cov, keys, best_opt_params, fixed_params, rotation_key)
+        for key in active_bounds:
+            cov_transformed_dict['errors'].pop(rotation_key if key == 'mu' else key, None)
 
     return error_dict, cov, cov_transformed_dict
 
-def transform_cov_matrix(cov, keys, best_opt_params, fixed_params, rotation_key=None, v_r0_is_raw=False):
+def transform_cov_matrix(cov, keys, best_opt_params, fixed_params, rotation_key=None):
     """Transform a covariance matrix from optimisation space to physical/output space.
 
     Maths:
@@ -511,7 +507,6 @@ def transform_cov_matrix(cov, keys, best_opt_params, fixed_params, rotation_key=
     best_opt_params: dict of best-fit optimised parameters in physical space (the point at which we evaluate J)
     fixed_params: dict of fixed parameters (the point at which we evaluate J)
     rotation_key: str of None, the original rotation parameter which we want to transform into ('rc' or 'omega')
-    v_r0_is_raw: bool, whether v_r0 is in raw space (before softplus transformation)
 
     Returns:
     new_cov: covariance matrix transformed into original parameter space, with same order as keys but with 'mu' replaced by rotation_key if rotation_key is not None
@@ -529,15 +524,7 @@ def transform_cov_matrix(cov, keys, best_opt_params, fixed_params, rotation_key=
                 raise ValueError(f"'{required_key}' must be present in either best_opt_params or fixed_params")
 
     # build the vector at which to evaluate the jacobian
-    params_list = []
-    for k in keys:
-        if k == 'v_r0' and v_r0_is_raw:
-            v_r0_best = gradient_descent.to_float64(best_opt_params[k])
-            if not bool(v_r0_best > 0): #should never be triggered
-                raise ValueError(f"best fit v_r0 must be positive, got v_r0={v_r0_best}")
-            params_list.append(gradient_descent.inv_softplus(v_r0_best))
-        else:
-            params_list.append(float(best_opt_params[k]))
+    params_list = [float(best_opt_params[k]) for k in keys]
     params_vec = jnp.array(params_list, dtype=jnp.float64)
 
     def transform(vec_A):
@@ -555,8 +542,6 @@ def transform_cov_matrix(cov, keys, best_opt_params, fixed_params, rotation_key=
         for k in keys:
             if k == 'mu' and rotation_key is not None:
                 output.append(rotation_val)
-            elif k == 'v_r0' and v_r0_is_raw:
-                output.append(gradient_descent.softplus(opt_params[k]))
             else:
                 output.append(opt_params[k])
         return jnp.stack(output)

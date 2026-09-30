@@ -40,6 +40,7 @@ class StreamState(NamedTuple):
     epsilon: jnp.ndarray
     ecc: jnp.ndarray
     vk0: jnp.ndarray
+    orb_ang0: jnp.ndarray
 
 
 @jax.jit
@@ -90,30 +91,39 @@ def mu_from_omega(omega, mass, r0):
 @jax.jit
 def build_stream_quantities(mass, r0, theta0, mu, v_r0):
     '''
-    precompute streamer quantities reused throughout file, and 
+    precompute streamer quantities reused throughout file, and
     store in class StreamState (near top)
-    '''
-    # Protect near-zero v_r0 from creating singularities in nu calculation
-    threshold = to_float64(eps)
-    v_r0 = jnp.where(
-        jnp.isclose(v_r0, to_float64(0.0)),
-        jnp.sign(v_r0) * threshold, #let it continue in the direction it was going
-        v_r0  # normal values -> unchanged
-        )
-    threshold = to_float64(eps)
-    v_r0_protected = jnp.sign(v_r0) * jnp.maximum(jnp.abs(v_r0), threshold)
-    v_r0_protected = jnp.where(v_r0 == 0.0, threshold, v_r0_protected)  # handle exact 0
 
+    v_r0 sign convention: v_r0 > 0 is infall at r0, v_r0 = 0 means r0 is the
+    apocentre, and v_r0 < 0 means the gas is still moving outwards at r0 (it
+    turns around at an apocentre beyond r0 before falling in). The fit restricts
+    v_r0 >= 0, but the smooth continuation to v_r0 < 0 is what makes the gradient
+    well-defined at v_r0 = 0.
+
+    The initial orbital angle is computed in closed form rather than from
+    arccos(cos(orb_ang0)), since
+        e cos(orb_ang0) = 1 - mu sin^2(theta0)
+        e sin(orb_ang0) = nu sin(theta0)
+    (from the orbit equation and v_r at r0). This makes orb_ang0 an odd, smooth
+    function of v_r0, so the model is differentiable through v_r0 = 0.
+    The arccos form gives orb_ang0 ~ |v_r0|, which has a kink at v_r0 = 0.
+    '''
     mu = to_float64(mu)
     rc = mu * r0
-    nu = v_r0_protected * jnp.sqrt(rc / (G * mass))
+    nu = v_r0 * jnp.sqrt(rc / (G * mass))
     sin_theta0 = jnp.sin(theta0)
     sin_theta0_sq = jnp.power(sin_theta0, 2)
     epsilon = jnp.power(nu, 2) + jnp.power(mu, 2) * sin_theta0_sq - 2 * mu
-    ecc = jnp.sqrt(1.0 + epsilon * sin_theta0_sq)
+
+    # e^2 = 1 + epsilon sin^2(theta0) = (nu sin(theta0))^2 + (1 - mu sin^2(theta0))^2
+    # the sum-of-squares form is strictly positive for mu < 1, so gradients are finite at v_r0 = 0
+    ecc_sin_orb_ang0 = nu * sin_theta0
+    ecc_cos_orb_ang0 = 1.0 - mu * sin_theta0_sq
+    ecc = jnp.sqrt(jnp.power(ecc_sin_orb_ang0, 2) + jnp.power(ecc_cos_orb_ang0, 2))
+    orb_ang0 = jnp.arctan2(ecc_sin_orb_ang0, ecc_cos_orb_ang0)
     vk0 = v_k(rc, mass=mass)
 
-    return StreamState(rc=rc, mu=mu, nu=nu, epsilon=epsilon, ecc=ecc, vk0=vk0)
+    return StreamState(rc=rc, mu=mu, nu=nu, epsilon=epsilon, ecc=ecc, vk0=vk0, orb_ang0=orb_ang0)
 
 @jax.jit
 def safe_arccos(x, eps=1e-10):
@@ -206,12 +216,10 @@ def stream_line(r, r_mask, stream_state, theta0=jnp.radians(30), phi0=jnp.radian
     '''
     r = jnp.asarray(r, dtype=FLOAT_DTYPE)
     rc = stream_state.rc
-    mu = stream_state.mu
     ecc = stream_state.ecc
 
     # orb_ang is varphi in Mendoza+2009
-    # at initial position r_to_rc = r0/rc = 1/mu
-    orb_ang0 = get_orb_ang(r_to_rc=1/mu, theta0=theta0, ecc=ecc)
+    orb_ang0 = stream_state.orb_ang0
 
     r_to_rc_raw = r / rc
     r_to_rc = jnp.where(r_mask, r_to_rc_raw, to_float64(0.6))
@@ -371,7 +379,7 @@ def evaluate_streamline_at_radius(r, mass, r0, theta0, phi0, mu, v_r0, inc, pa):
     r_valid = (r >= r_low) & (r <= r0) & (r > 0.0)
     r_for_eval = jnp.where(r_valid, r, r_low)
 
-    orb_ang0 = get_orb_ang(r_to_rc=1.0 / mu, theta0=theta0, ecc=ecc)
+    orb_ang0 = stream_state.orb_ang0
     orb_ang = get_orb_ang(r_to_rc=r_for_eval / rc, theta0=theta0, ecc=ecc)
     theta = get_theta(theta0, orb_ang, orb_ang0)
     phi = phi0 + get_dphi(theta, theta0=theta0)
@@ -452,7 +460,8 @@ def xyz_stream(mass=0.5, r0=1e4, theta0=jnp.radians(30),
     :param theta0: Initial polar angle of streamline (unitless, radians)
     :param phi0: Initial azimuthal angle of streamline (unitless, radians)
     :param mu: dimensionless, rc/r0 in (0, 1)
-    :param v_r0: Initial radial velocity of the streamline, (km/s)
+    :param v_r0: Initial radial velocity of the streamline, (km/s). v_r0 > 0 is infall at r0,
+        v_r0 = 0 means r0 is the apocentre, v_r0 < 0 means gas is still moving outwards at r0
     :param inc: inclination with respect of line-of-sight, inc=0 is an edge-on-disk (unitless, radians)
     :param pa: Position angle of the rotation axis, measured due East from North. This is usually estimated from the outflow PA, or the disk PA-90deg., (unitless, radians)
     :param rmin: smallest radius for calculation, (unitless, au)
@@ -501,7 +510,7 @@ def xyz_stream(mass=0.5, r0=1e4, theta0=jnp.radians(30),
     r_full = jnp.concatenate((jnp.asarray([r0], dtype=FLOAT_DTYPE), r))
     theta_full = jnp.concatenate((jnp.asarray([theta0], dtype=FLOAT_DTYPE), theta))
     phi_full = jnp.concatenate((jnp.asarray([phi0], dtype=FLOAT_DTYPE), phi))
-    orb_ang0 = get_orb_ang(r_to_rc=1/mu, theta0=theta0, ecc=ecc)
+    orb_ang0 = stream_state.orb_ang0
     orb_ang_full = jnp.concatenate((jnp.asarray([orb_ang0], dtype=FLOAT_DTYPE), orb_ang))
     v_r0_consistent, v_theta0_consistent, v_phi0_consistent = stream_line_vel(
         r0, theta0, orb_ang0, stream_state=stream_state, theta0=theta0, r_mask=None

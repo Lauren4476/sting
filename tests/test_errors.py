@@ -100,12 +100,6 @@ _gd.check_loss_method = lambda m: int(m)
 _gd.gradient_l2_norm = lambda g: float(jnp.sqrt(jnp.sum(g**2)))
 _gd.chi2_loss = None
 
-def _softplus(x):
-    return jnp.log1p(jnp.exp(x))
-
-def _inv_softplus(y):
-    return jnp.log(jnp.expm1(y))
-
 def _to_float64_gd(x):
     return jnp.asarray(x, dtype=jnp.float64)
 
@@ -117,8 +111,6 @@ def _compute_prior_penalty(model_params, priors_means, priors_sigmas, priors_key
         penalty = penalty + ((model_params[key] - mu_p) / sigma_p) ** 2
     return penalty
 
-_gd.softplus = _softplus
-_gd.inv_softplus = _inv_softplus
 _gd.to_float64 = _to_float64_gd
 _gd.compute_prior_penalty = _compute_prior_penalty
 
@@ -597,7 +589,7 @@ class TestTransformCovMatrix:
             transform_cov_matrix(cov, keys, best, {}, rotation_key="rc")
 
     def test_no_rotation_key_returns_identity_transform(self):
-        """With rotation_key=None and no v_r0, the Jacobian is the identity
+        """With rotation_key=None, the Jacobian is the identity
         matrix, so the returned covariance should equal the input covariance."""
         cov = np.diag([4.0, 0.01, 1.0])
         keys = ["r0", "inc", "mass"]
@@ -605,7 +597,7 @@ class TestTransformCovMatrix:
         result = transform_cov_matrix(
             jnp.array(cov, dtype=jnp.float64),
             keys, best, {},
-            rotation_key=None, v_r0_is_raw=False,
+            rotation_key=None,
         )
         np.testing.assert_allclose(
             np.array(result["cov"]), cov, atol=1e-9,

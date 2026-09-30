@@ -14,7 +14,7 @@ def test_continuous_loss_matches_synthetic_point_cloud():
         'theta0': 0.5,
         'phi0': 0.2,
         'mu': 0.3,
-        'v_r0': -2.0,
+        'v_r0': 2.0,
         'inc': 0.0,
         'pa': 0.0,
         'rmin': 20.0,

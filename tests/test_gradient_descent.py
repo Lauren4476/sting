@@ -6,7 +6,6 @@ running the full Adam optimisation loop or requiring real observational data:
   - Module-level constants and collections (LOSS_METHOD_CHOICES, ANGLE_KEYS,
     DISPLAY_UNITS, STREAMLINE_MODEL_PARAM_KEYS, CANONICAL_UNITS)
   - to_float64: dtype and value preservation
-  - softplus / inv_softplus: positivity, monotonicity, round-trip
   - is_numeric_value: type dispatch
   - check_loss_method: valid/invalid method validation
   - trace_fieldnames_for_loss_method: structure and method-specific keys
@@ -16,11 +15,12 @@ running the full Adam optimisation loop or requiring real observational data:
   - sanitize_param_partition: overlap detection, rotation-key uniqueness,
     missing-parameter detection, require_nonempty_opt flag
   - standardise_param_bounds: unknown key rejection, None passthrough
-  - build_normalisation_spec: missing bounds, invalid bounds, value-out-of-range
-  - normalise_opt_params / denormalise_opt_params: round-trip and v_r0 softplus path
+  - build_normalisation_spec: r0/mass bounds required, automatic normalisation for other params, invalid bounds, value-out-of-range
+  - get_physical_bounds: user bounds for r0/mass, automatic bounds otherwise
+  - normalise_opt_params / denormalise_opt_params: round-trip, including v_r0 through zero
   - get_rotation_param_key: correct key identification and missing-key error
   - mu_from_rotation_param / rotation_param_from_mu: round-trips for all three keys
-  - with_mu_substituted: mu substitution in opt and fixed, bound replacement
+  - with_mu_substituted: mu substitution in opt and fixed
   - format_param: angle conversion, unit suffix, unknown key
   - build_trace_row: structure, component keys for each loss method
   - trace_tree_to_python: scalar conversion, nested structure, None preservation
@@ -113,11 +113,9 @@ def _full_fixed_params():
 
 
 def _make_bounds(opt_params):
-    """Return simple (value*0.5, value*2) bounds for every non-v_r0 key."""
+    """Return simple (value*0.5, value*2) bounds for every key."""
     bounds = {}
     for k, v in opt_params.items():
-        if k == "v_r0":
-            continue
         lo = float(v) * 0.5 if float(v) > 0 else -abs(float(v)) * 2
         hi = float(v) * 2.0 if float(v) > 0 else abs(float(v)) * 0.5
         if lo >= hi:
@@ -201,56 +199,6 @@ class TestToFloat64:
 
     def test_float32_upcast(self):
         result = gd.to_float64(np.float32(1.5))
-        assert result.dtype == jnp.float64
-
-
-# ===========================================================================
-# softplus / inv_softplus
-# ===========================================================================
-
-class TestSoftplus:
-    """Unit tests for the softplus activation."""
-
-    def test_positive_output_for_any_input(self):
-        for x in [-5.0, -1.0, 0.0, 1.0, 5.0]:
-            assert float(gd.softplus(jnp.array(x))) > 0.0
-
-    def test_monotonically_increasing(self):
-        xs = jnp.linspace(-3.0, 3.0, 20)
-        ys = jnp.array([gd.softplus(x) for x in xs])
-        assert np.all(np.diff(np.array(ys)) > 0)
-
-    def test_large_positive_approx_identity(self):
-        x = 20.0
-        assert pytest.approx(float(gd.softplus(jnp.array(x))), rel=1e-4) == x
-
-    def test_output_dtype_is_float64(self):
-        result = gd.softplus(jnp.array(1.0, dtype=jnp.float64))
-        assert result.dtype == jnp.float64
-
-    def test_zero_gives_log_two(self):
-        assert pytest.approx(float(gd.softplus(jnp.array(0.0))), rel=1e-6) == math.log(2)
-
-
-class TestInvSoftplus:
-    """Unit tests for the inverse softplus."""
-
-    def test_roundtrip_softplus_then_inv(self):
-        for y in [0.5, 1.0, 2.0, 5.0]:
-            y_arr = jnp.array(y, dtype=jnp.float64)
-            x = gd.inv_softplus(y_arr)
-            recovered = gd.softplus(x)
-            assert pytest.approx(float(recovered), rel=1e-6) == y
-
-    def test_roundtrip_inv_then_softplus(self):
-        for x in [-2.0, 0.0, 1.0, 3.0]:
-            x_arr = jnp.array(x, dtype=jnp.float64)
-            y = gd.softplus(x_arr)
-            recovered = gd.inv_softplus(y)
-            assert pytest.approx(float(recovered), rel=1e-6) == x
-
-    def test_output_dtype_is_float64(self):
-        result = gd.inv_softplus(jnp.array(1.0, dtype=jnp.float64))
         assert result.dtype == jnp.float64
 
 
@@ -634,9 +582,47 @@ class TestStandardiseParamBounds:
 class TestBuildNormalisationSpec:
     """Unit tests for the normalisation spec builder."""
 
-    def test_none_param_bounds_raises(self):
-        with pytest.raises(ValueError, match="param_bounds is required"):
+    def test_none_param_bounds_raises_for_r0(self):
+        with pytest.raises(ValueError, match="Missing bounds"):
             gd.build_normalisation_spec({"r0": 100.0}, None)
+
+    def test_none_param_bounds_ok_for_auto_params(self):
+        opt = {"theta0": 0.5, "phi0": 1.0, "inc": 0.1, "pa": 2.0, "mu": 0.3, "v_r0": 0.5, "v_lsr": 7.0}
+        spec = gd.build_normalisation_spec(opt, None)
+        assert set(spec) == set(opt)
+
+    def test_mass_requires_bounds(self):
+        with pytest.raises(ValueError, match="Missing bounds"):
+            gd.build_normalisation_spec({"mass": 1.0}, {})
+
+    def test_sampling_params_cannot_be_optimised(self):
+        for key in ("rmin", "deltar"):
+            with pytest.raises(ValueError, match="cannot be optimised"):
+                gd.build_normalisation_spec({key: 10.0}, {key: (1.0, 100.0)})
+
+    def test_auto_bounds_used_for_angles_and_mu(self):
+        spec = gd.build_normalisation_spec({"theta0": 0.5, "inc": 0.1, "mu": 0.3}, None)
+        assert pytest.approx(float(spec["theta0"]["offset"])) == 0.0
+        assert pytest.approx(float(spec["theta0"]["scale"])) == math.pi
+        assert pytest.approx(float(spec["inc"]["offset"])) == -math.pi / 2
+        assert pytest.approx(float(spec["inc"]["scale"])) == math.pi
+        assert pytest.approx(float(spec["mu"]["offset"])) == 1e-6
+        for k in spec:
+            assert float(spec[k]["clip_min"]) == 0.0
+            assert float(spec[k]["clip_max"]) == 1.0
+
+    def test_user_bounds_for_auto_params_ignored(self, capsys):
+        spec = gd.build_normalisation_spec(
+            {"theta0": 0.5, "v_r0": 0.5},
+            {"theta0": (0.2, 0.8), "v_r0": (0.0, 3.0), "rc": (10.0, 100.0)},
+        )
+        assert pytest.approx(float(spec["theta0"]["scale"])) == math.pi
+        assert float(spec["v_r0"]["clip_min"]) == 0.0
+        assert math.isinf(float(spec["v_r0"]["clip_max"]))
+        out = capsys.readouterr().out
+        assert "Ignoring supplied bounds" in out
+        for key in ("theta0", "v_r0", "rc"):
+            assert key in out
 
     def test_missing_bound_for_opt_param_raises(self):
         with pytest.raises(ValueError, match="Missing bounds"):
@@ -671,14 +657,43 @@ class TestBuildNormalisationSpec:
         spec = gd.build_normalisation_spec({"r0": 300.0}, {"r0": (100.0, 500.0)})
         assert pytest.approx(float(spec["r0"]["offset"])) == 100.0
 
-    def test_v_r0_skipped_even_without_bounds(self):
-        """v_r0 uses softplus instead of normalisation, so no bounds are needed."""
+    def test_v_r0_uses_fixed_scale_and_minimum_zero(self):
+        """v_r0 needs no bounds: offset 0, a fixed scale, clipped at 0 from below only."""
         spec = gd.build_normalisation_spec(
             {"r0": 300.0, "v_r0": 2.0},
-            {"r0": (100.0, 500.0)},  # no v_r0 bounds
+            {"r0": (100.0, 500.0)},
         )
-        assert "v_r0" not in spec
-        assert "r0" in spec
+        assert pytest.approx(float(spec["v_r0"]["offset"])) == 0.0
+        assert pytest.approx(float(spec["v_r0"]["scale"])) == gd.AUTO_NORMALISATION["v_r0"]["scale"]
+        assert float(spec["v_r0"]["clip_min"]) == 0.0
+        assert math.isinf(float(spec["v_r0"]["clip_max"]))
+        assert float(spec["r0"]["clip_min"]) == 0.0
+        assert float(spec["r0"]["clip_max"]) == 1.0
+
+    def test_negative_initial_v_r0_raises(self):
+        with pytest.raises(ValueError, match="below its minimum"):
+            gd.build_normalisation_spec({"v_r0": -0.5}, None)
+
+    def test_v_r0_zero_initial_allowed(self):
+        spec = gd.build_normalisation_spec({"v_r0": 0.0}, None)
+        norm = gd.normalise_opt_params({"v_r0": 0.0}, spec)
+        assert float(norm["v_r0"]) == 0.0
+
+    def test_v_lsr_unbounded(self):
+        spec = gd.build_normalisation_spec({"v_lsr": -7.0}, None)
+        assert math.isinf(float(spec["v_lsr"]["clip_min"]))
+        assert math.isinf(float(spec["v_lsr"]["clip_max"]))
+
+    def test_v_r0_roundtrip(self):
+        spec = gd.build_normalisation_spec({"v_r0": 0.0}, {})
+        for v in [0.0, 1e-9, 0.3, 12.0]:
+            norm = gd.normalise_opt_params({"v_r0": v}, spec)
+            recovered = gd.denormalise_opt_params(norm, spec)
+            assert pytest.approx(float(recovered["v_r0"]), abs=1e-12) == v
+
+    def test_r0_still_requires_bounds_alongside_v_r0(self):
+        with pytest.raises(ValueError, match="Missing bounds"):
+            gd.build_normalisation_spec({"r0": 300.0, "v_r0": 2.0}, {})
 
     def test_multiple_params_all_in_spec(self):
         opt = {"r0": 300.0, "mass": 1.0}
@@ -714,33 +729,47 @@ class TestNormaliseDenormaliseRoundTrip:
         for k in opt:
             assert pytest.approx(float(recovered[k]), rel=1e-9) == float(opt[k])
 
-    def test_v_r0_normalised_via_softplus(self):
-        """v_r0 is stored as inv_softplus(v_r0) in normalised space."""
-        opt = {"v_r0": 2.0}
-        spec = {}  # no spec needed for v_r0
-        norm = gd.normalise_opt_params(opt, spec)
-        expected_raw = float(gd.inv_softplus(gd.to_float64(2.0)))
-        assert pytest.approx(float(norm["v_r0"]), rel=1e-6) == expected_raw
-
-    def test_v_r0_denormalised_via_softplus(self):
-        """Denormalising v_r0 applies softplus."""
-        raw = gd.inv_softplus(gd.to_float64(3.0))
-        norm = {"v_r0": raw}
-        recovered = gd.denormalise_opt_params(norm, {})
-        assert pytest.approx(float(recovered["v_r0"]), rel=1e-6) == 3.0
-
-    def test_negative_v_r0_raises(self):
-        with pytest.raises(ValueError, match="non-negative"):
-            gd.normalise_opt_params({"v_r0": -1.0}, {})
+    def test_v_r0_normalised_linearly(self):
+        """v_r0 is normalised as v_r0 / scale (no positivity transform)."""
+        spec = gd.build_normalisation_spec({"v_r0": 1.0}, None)
+        norm = gd.normalise_opt_params({"v_r0": 1.0}, spec)
+        assert pytest.approx(float(norm["v_r0"]), rel=1e-12) == 1.0 / gd.AUTO_NORMALISATION["v_r0"]["scale"]
 
     def test_phi0_wraps_modulo_2pi(self):
         """phi0 uses modular arithmetic; check the result is in [0, 2pi)."""
         opt = {"phi0": math.radians(45)}
-        spec = gd.build_normalisation_spec(opt, {"phi0": (0.0, 2 * math.pi)})
+        spec = gd.build_normalisation_spec(opt, None)
         norm = gd.normalise_opt_params(opt, spec)
         denorm = gd.denormalise_opt_params(norm, spec)
         result = float(denorm["phi0"])
         assert 0.0 <= result < 2 * math.pi + 1e-9
+
+    def test_phi0_and_pa_are_cyclic(self):
+        spec = gd.build_normalisation_spec({"phi0": 1.0, "pa": 2.0, "inc": 0.1}, None)
+        assert spec["phi0"]["cyclic"] is True
+        assert spec["pa"]["cyclic"] is True
+        assert spec["inc"]["cyclic"] is False
+        assert gd.is_cyclic_param("pa") and gd.is_cyclic_param("phi0")
+        assert not gd.is_cyclic_param("theta0")
+
+    def test_pa_initial_value_outside_range_is_wrapped(self):
+        """pa = -10 deg is accepted and wrapped to 350 deg."""
+        opt = {"pa": math.radians(-10)}
+        spec = gd.build_normalisation_spec(opt, None)
+        norm = gd.normalise_opt_params(opt, spec)
+        assert 0.0 <= float(norm["pa"]) < 1.0
+        denorm = gd.denormalise_opt_params(norm, spec)
+        assert pytest.approx(float(denorm["pa"]), rel=1e-12) == math.radians(350)
+
+    def test_pa_wraps_across_zero_when_denormalised(self):
+        """A normalised step just below 0 maps to just below 2pi, not clipped to 0."""
+        spec = gd.build_normalisation_spec({"pa": 0.1}, None)
+        denorm = gd.denormalise_opt_params({"pa": gd.to_float64(-0.01)}, spec)
+        assert pytest.approx(float(denorm["pa"]), rel=1e-12) == 0.99 * 2 * math.pi
+
+    def test_non_cyclic_angle_outside_range_still_raises(self):
+        with pytest.raises(ValueError, match="outside bounds"):
+            gd.build_normalisation_spec({"inc": math.radians(100)}, None)
 
 
 # ===========================================================================
@@ -821,30 +850,30 @@ class TestWithMuSubstituted:
 
     def test_rc_in_opt_becomes_mu_in_opt(self):
         opt, fixed = self._base_params("rc")
-        result_opt, result_fixed, _, _ = gd.with_mu_substituted(opt, fixed)
+        result_opt, result_fixed, _ = gd.with_mu_substituted(opt, fixed)
         assert "mu" in result_opt
         assert "rc" not in result_opt
 
     def test_omega_in_opt_becomes_mu_in_opt(self):
         opt, fixed = self._base_params("omega")
-        result_opt, result_fixed, _, _ = gd.with_mu_substituted(opt, fixed)
+        result_opt, result_fixed, _ = gd.with_mu_substituted(opt, fixed)
         assert "mu" in result_opt
         assert "omega" not in result_opt
 
     def test_mu_in_opt_stays_mu(self):
         opt, fixed = self._base_params("mu")
-        result_opt, _, _, rotation_key = gd.with_mu_substituted(opt, fixed)
+        result_opt, _, rotation_key = gd.with_mu_substituted(opt, fixed)
         assert "mu" in result_opt
         assert rotation_key == "mu"
 
     def test_rotation_key_returned_correctly_for_rc(self):
         opt, fixed = self._base_params("rc")
-        _, _, _, rotation_key = gd.with_mu_substituted(opt, fixed)
+        _, _, rotation_key = gd.with_mu_substituted(opt, fixed)
         assert rotation_key == "rc"
 
     def test_rotation_key_returned_correctly_for_omega(self):
         opt, fixed = self._base_params("omega")
-        _, _, _, rotation_key = gd.with_mu_substituted(opt, fixed)
+        _, _, rotation_key = gd.with_mu_substituted(opt, fixed)
         assert rotation_key == "omega"
 
     def test_rc_in_fixed_becomes_mu_in_fixed(self):
@@ -852,96 +881,57 @@ class TestWithMuSubstituted:
         del opt["mu"]
         fixed = _full_fixed_params()
         fixed["rc"] = 300.0
-        result_opt, result_fixed, _, _ = gd.with_mu_substituted(opt, fixed)
+        result_opt, result_fixed, _ = gd.with_mu_substituted(opt, fixed)
         assert "mu" in result_fixed
         assert "rc" not in result_fixed
-
-    def test_mu_bounds_added_when_rc_in_opt(self):
-        opt, fixed = self._base_params("rc")
-        bounds = {"rc": (100.0, 500.0)}
-        _, _, result_bounds, _ = gd.with_mu_substituted(opt, fixed, param_bounds=bounds)
-        assert "mu" in result_bounds
-        assert "rc" not in result_bounds
 
     def test_mu_value_correct_for_rc_substitution(self):
         opt, fixed = self._base_params("rc")
         rc_val = opt["rc"]
         r0_val = opt["r0"]
-        result_opt, _, _, _ = gd.with_mu_substituted(opt, fixed)
+        result_opt, _, _ = gd.with_mu_substituted(opt, fixed)
         expected_mu = rc_val / r0_val
         assert pytest.approx(float(result_opt["mu"]), rel=1e-9) == expected_mu
 
 
 # ==========================================================================
-# auto_fill_angle_bounds
+# get_physical_bounds
 # =========================================================================
 
-class TestAutoFillAngleBounds:
-    """Units tests for the autoatic theta0/phi0 bound filler."""
+class TestGetPhysicalBounds:
+    """Unit tests for the physical bounds used to clip covariance samples."""
 
-    def test_theta0_bounds_added_when_optimised(self):
-        opt_params = {"theta0": math.radians(30), "r0": 1000.0}
-        result = gd.auto_fill_angle_bounds(opt_params, {"r0": (500.0, 2000.0)})
-        assert result["theta0"] == (0.0, math.pi)
-    
-    def test_phi0_bounds_added_when_optimised(self):
-        opt_params = {"phi0": math.radians(200), "r0": 1000.0}
-        result = gd.auto_fill_angle_bounds(opt_params, {"r0": (500.0, 2000.0)})
-        assert result["phi0"] == (0.0, 2 * math.pi)
-
-    def test_not_added_when_fixed(self):
-        opt_params = {"r0": 1000.0}
-        result = gd.auto_fill_angle_bounds(opt_params, {"r0": (500.0, 2000.0)})
-        assert "theta0" not in result
-        assert "phi0" not in result
-
-    def test_other_bounds_left_untouched(self):
-        opt_params = {"theta0": math.radians(30), "r0": 1000.0}
-        result = gd.auto_fill_angle_bounds(opt_params, {"r0": (500.0, 2000.0)})
-        assert result["r0"] == (500.0, 2000.0)
-    
-    def test_none_param_bounds_treated_as_empty(self):
-        opt_params = {"theta0": math.radians(30), "phi0": math.radians(200)}
-        result = gd.auto_fill_angle_bounds(opt_params, None)
-        assert result == {"theta0": (0.0, math.pi), "phi0": (0.0, 2 * math.pi)}
-
-    def test_user_supplied_theta0_bounds_overriden(self):
-        opt_params = {"theta0": math.radians(30)}
-        user_bounds = {"theta0": (math.radians(10), math.radians(80))}
-        result = gd.auto_fill_angle_bounds(opt_params, user_bounds)
-        assert result["theta0"] == (0.0, math.pi)  # overridden
-
-    def test_user_supplied_phi0_bounds_overriden(self):
-        opt_params = {"phi0": math.radians(200)}
-        user_bounds = {"phi0": (math.radians(100), math.radians(300))}
-        result = gd.auto_fill_angle_bounds(opt_params, user_bounds)
-        assert result["phi0"] == (0.0, 2 * math.pi)  # overridden
-
-    def test_does_not_mutate_input_param_bounds(self):
-        """ should return a new dict rather than mutating the user's bounds dict"""
-        opt_params = {"theta0": math.radians(30), "phi0": math.radians(200)}
-        user_bounds = {"r0": (500.0, 2000.0)}
-        result = gd.auto_fill_angle_bounds(opt_params, user_bounds)
-        assert "theta0" not in user_bounds
-        assert "phi0" not in user_bounds
-        assert result is not user_bounds
-
-    def test_accepts_set_of_keys(self):
-        """since the function only checks membership, a set of keys should work as well as a dict"""
-        opt_keys = {"theta0", "phi0", "r0"}
-        result = gd.auto_fill_angle_bounds(opt_keys, None)
+    def test_auto_bounds_for_angles_and_mu(self):
+        result = gd.get_physical_bounds(["theta0", "phi0", "mu"], None)
         assert result["theta0"] == (0.0, math.pi)
         assert result["phi0"] == (0.0, 2 * math.pi)
+        assert result["mu"] == (1e-6, 1.0 - 1e-6)
 
-    def test_bounds_in_radians(self):
-        """The bounds returned should be plain floats in radians, not degrees."""
-        opt_params = {"theta0": math.radians(30), "phi0": math.radians(200)}
-        result = gd.auto_fill_angle_bounds(opt_params, None)
-        for key in ("theta0", "phi0"):
-            lo, hi = result[key]
+    def test_user_bounds_for_r0_and_mass(self):
+        result = gd.get_physical_bounds(["r0", "mass"], {"r0": (500.0, 2000.0), "mass": (0.5, 2.0)})
+        assert result == {"r0": (500.0, 2000.0), "mass": (0.5, 2.0)}
+
+    def test_unbounded_and_unsupplied_params_left_out(self):
+        result = gd.get_physical_bounds(["r0", "v_lsr"], None)
+        assert result == {}
+
+    def test_v_r0_has_minimum_zero_only(self):
+        result = gd.get_physical_bounds(["v_r0"], None)
+        assert result == {"v_r0": (0.0, math.inf)}
+
+    def test_user_bounds_for_auto_params_ignored(self):
+        result = gd.get_physical_bounds(["theta0", "v_r0"], {"theta0": (0.2, 0.8), "v_r0": (0.5, 3.0)})
+        assert result == {"theta0": (0.0, math.pi), "v_r0": (0.0, math.inf)}
+
+    def test_only_optimised_keys_returned(self):
+        result = gd.get_physical_bounds(["r0"], {"r0": (500.0, 2000.0), "mass": (0.5, 2.0)})
+        assert set(result) == {"r0"}
+
+    def test_bounds_are_plain_floats(self):
+        result = gd.get_physical_bounds(["theta0", "phi0"], None)
+        for lo, hi in result.values():
             assert isinstance(lo, float)
             assert isinstance(hi, float)
-
 
 # ===========================================================================
 # validate_priors
@@ -1368,6 +1358,55 @@ class TestTraceTreeToPython:
     def test_plain_string_passthrough(self):
         result = gd.trace_tree_to_python("hello")
         assert result == "hello"
+
+
+# ===========================================================================
+# find_active_bounds / projected_gradient_l2_norm
+# ===========================================================================
+
+class TestActiveBounds:
+    """Parameters on a clip bound with the gradient pushing past it."""
+
+    def _spec(self):
+        return gd.build_normalisation_spec(
+            {"r0": 300.0, "v_r0": 0.0, "phi0": 0.0, "theta0": 1.0},
+            {"r0": (100.0, 500.0)},
+        )
+
+    def test_v_r0_at_zero_pushing_down_is_active(self):
+        spec = self._spec()
+        norm = {"r0": 0.5, "v_r0": 0.0, "phi0": 0.0, "theta0": 0.3}
+        grads = {"r0": 0.0, "v_r0": 0.12, "phi0": 0.0, "theta0": 0.0}
+        assert gd.find_active_bounds(norm, grads, spec) == {"v_r0": "lower"}
+
+    def test_at_bound_but_gradient_pointing_inwards_not_active(self):
+        spec = self._spec()
+        norm = {"r0": 0.0, "v_r0": 0.0, "phi0": 0.0, "theta0": 0.3}
+        grads = {"r0": -1.0, "v_r0": -0.1, "phi0": 0.0, "theta0": 0.0}
+        assert gd.find_active_bounds(norm, grads, spec) == {}
+
+    def test_upper_bound_active(self):
+        spec = self._spec()
+        norm = {"r0": 1.0, "v_r0": 0.5, "phi0": 0.2, "theta0": 0.3}
+        grads = {"r0": -2.0, "v_r0": 0.0, "phi0": 0.0, "theta0": 0.0}
+        assert gd.find_active_bounds(norm, grads, spec) == {"r0": "upper"}
+
+    def test_interior_not_active(self):
+        spec = self._spec()
+        norm = {"r0": 0.5, "v_r0": 0.5, "phi0": 0.2, "theta0": 0.3}
+        grads = {"r0": 1.0, "v_r0": 1.0, "phi0": 1.0, "theta0": 1.0}
+        assert gd.find_active_bounds(norm, grads, spec) == {}
+
+    def test_cyclic_param_never_active(self):
+        spec = self._spec()
+        norm = {"r0": 0.5, "v_r0": 0.5, "phi0": 0.0, "theta0": 0.3}
+        grads = {"r0": 0.0, "v_r0": 0.0, "phi0": 5.0, "theta0": 0.0}
+        assert gd.find_active_bounds(norm, grads, spec) == {}
+
+    def test_projected_norm_excludes_active(self):
+        grads = {"r0": jnp.float64(3.0), "v_r0": jnp.float64(100.0), "mass": jnp.float64(4.0)}
+        assert pytest.approx(float(gd.projected_gradient_l2_norm(grads, {"v_r0": "lower"}))) == 5.0
+        assert pytest.approx(float(gd.projected_gradient_l2_norm(grads, {}))) == float(np.sqrt(9 + 1e4 + 16))
 
 
 # ===========================================================================

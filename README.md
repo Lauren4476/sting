@@ -125,6 +125,8 @@ model_params, initial_opt_params, fixed_params = gradient_descent.prepare_model_
 )
 
 # --- 3. Set bounds for 'r0', 'mass', if any of these are in initial_opt_params ---
+# (these are the only parameters that need bounds: angles and rc/omega use their physical ranges automatically,
+#  and v_r0 is kept >= 0 (infall at r0) with no upper bound)
 param_bounds = {
     'r0': (200.0, 10000.0) * u.au,
     'mass': (3.0, 5.0) * u.Msun,

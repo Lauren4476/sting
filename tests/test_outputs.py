@@ -260,6 +260,21 @@ class TestSaveBestFitParams:
         sigma = data["optimised_parameters"]["inc"]["sigma"]
         assert pytest.approx(sigma, rel=1e-6) == 1.0  # should be 1 deg, not ~0.0175 rad
 
+    def test_at_bound_saved_without_sigma(self, tmp_path):
+        save_best_fit_params(
+            best_opt_params={"r0": 100.0, "v_r0": 0.0},
+            fixed_params={},
+            param_errors={"r0": 7.5},
+            save_folder=str(tmp_path),
+            at_bound={"v_r0": "lower"},
+        )
+        with open(tmp_path / "best_fit_params.json") as f:
+            data = json.load(f)
+        v_entry = data["optimised_parameters"]["v_r0"]
+        assert v_entry["at_bound"] == "lower"
+        assert "sigma" not in v_entry
+        assert "at_bound" not in data["optimised_parameters"]["r0"]
+
     def test_non_angle_error_stored_as_is(self, tmp_path):
         save_best_fit_params(
             best_opt_params={"r0": 100.0},
@@ -521,6 +536,13 @@ class TestPlotParamCorrelations:
         corr = cov / np.outer(diag, diag)
         assert np.allclose(np.diag(corr), 1.0)
 
+    def test_zero_variance_param_does_not_raise(self, tmp_path):
+        """A parameter held fixed at a bound has zero variance; the plot should still be made."""
+        cov = np.diag([4.0, 0.0, 1.0])
+        cov[0, 2] = cov[2, 0] = 1.0
+        plot_param_correlations(["r0", "v_r0", "mass"], cov, save_folder=str(tmp_path))
+        assert (tmp_path / "parameter_correlation_matrix.png").exists()
+
     def test_correlation_values_clipped_to_minus_one_one(self):
         """Numerically extreme covariances should never produce |corr| > 1."""
         cov = np.array([[1e-30, 1e30], [1e30, 1e-30]])
@@ -589,6 +611,15 @@ class TestSampleParameterSetsFromCovariance:
         assert np.all(samples[:, 0] >= 95.0)
         assert np.all(samples[:, 0] <= 105.0)
         _gd.convert_and_strip_bound_units = None  # restore
+
+    def test_cyclic_params_wrapped_not_clipped(self):
+        """pa samples near 0 wrap round to just below 2pi instead of piling up at 0."""
+        params = {"pa": 0.01}
+        cov = np.array([[0.04]])  # std = 0.2 rad, so many samples fall below 0
+        samples = sample_parameter_sets_from_covariance(params, cov, ["pa"], n_samples=500)
+        assert np.all((samples[:, 0] >= 0.0) & (samples[:, 0] < 2 * math.pi))
+        assert np.any(samples[:, 0] > math.pi)  # wrapped samples
+        assert np.sum(samples[:, 0] == 0.0) == 0  # no pile-up at the boundary
 
     def test_n_samples_one(self, simple_setup):
         params, cov, keys = simple_setup

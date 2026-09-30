@@ -76,12 +76,22 @@ CANONICAL_UNITS = {
 
 ANGLE_KEYS = {'theta0', 'phi0', 'inc', 'pa'}
 
-# might later add inc, pa here too
-ANGLE_BOUNDS_RAD = {
-    'theta0': (0.0, jnp.pi),
-    'phi0': (0.0, 2 * jnp.pi),
-    'inc': (-jnp.pi/2, jnp.pi/2),
-    'pa': (0.0, 2 * jnp.pi),
+# The only optimisable parameters whose range depends on the source, so the user must supply bounds
+USER_BOUNDED_PARAM_KEYS = ('r0', 'mass')
+
+# Normalisation of every other optimisable parameter is fixed here (canonical units), so no user bounds are needed:
+# - 'bounds': (min, max) set by physics. Normalised to [0, 1] and clipped during optimisation,
+#   or wrapped if 'cyclic' is True (azimuthal angles, where min and max are the same point).
+# - 'scale': no natural (min, max) range. Normalised as value/scale. Adam steps are ~learning_rate
+#   in normalised units, so this sets the step size. An optional one-sided 'min' is enforced by clipping.
+AUTO_NORMALISATION = {
+    'theta0': {'bounds': (0.0, jnp.pi)},
+    'phi0': {'bounds': (0.0, 2 * jnp.pi), 'cyclic': True},
+    'inc': {'bounds': (-jnp.pi/2, jnp.pi/2)},
+    'pa': {'bounds': (0.0, 2 * jnp.pi), 'cyclic': True},
+    'mu': {'bounds': (0.0+1e-6, 1.0-1e-6)},  # tiny epsilon to avoid rc=r0 or rc=0
+    'v_r0': {'scale': 1.0, 'min': 0.0},  # km/s. Infall only. The model is smooth through v_r0 = 0, so the bound is safe to sit on
+    'v_lsr': {'scale': 1.0},  # km/s
 }
 
 DISPLAY_UNITS = {
@@ -139,8 +149,9 @@ FitResult = namedtuple(
     [
         'best_opt_params',      # dict: best-fit optimised parameters in the original user-supplied parameterisation (rc/omega restored).
         'loss_history',     # list[float]: loss value at every epoch.
-        'param_errors',     # dict or None: 1-sigma errors in display parameterisation, or None if uncertainty estimation failed.
+        'param_errors',     # dict or None: 1-sigma errors in display parameterisation, or None if uncertainty estimation failed. Parameters in at_bound are left out.
         'covariance_result',       # CovarianceResult or None: full covariance information needed for sampling, or None if estimation failed.
+        'at_bound',         # dict: {display param name: 'lower' or 'upper'} for parameters that finished on a bound with the loss pushing past it.
     ]
 )
 
@@ -212,18 +223,6 @@ def is_numeric_value(value):
 def to_float64(value):
     """Convert a numeric value or array-like input to float64"""
     return jnp.asarray(value, dtype=jnp.float64)
-
-@jax.jit
-def softplus(x):
-    """Softplus, used for v_r0"""
-    return jnp.logaddexp(x, 0.0)         
-
-@jax.jit
-def inv_softplus(y):
-    """used for v_r0, stable for y>0"""
-    y = to_float64(y)
-    return y + jnp.log1p(-jnp.exp(-y))
-
 
 def get_checkify_error_message(err):
     """Extract human-readable error message from a checkify.Error if possible,
@@ -379,33 +378,51 @@ def standardise_param_bounds(param_bounds):
 
 
 def build_normalisation_spec(opt_params, param_bounds):
-    """Build shift and scale for normalisation ofoptimised parameters, from bounds.
-    Doesn't include v_r0 since we use softplus transform instead for that."""
-    if param_bounds is None:
+    """Build offset and scale for normalisation of optimised parameters.
+    r0 and mass are normalised from the user-supplied bounds. All other parameters use AUTO_NORMALISATION,
+    and any bounds the user supplied for them are ignored (with a notice)."""
+    param_bounds = {} if param_bounds is None else param_bounds
+
+    not_optimisable = [key for key in opt_params if key not in USER_BOUNDED_PARAM_KEYS and key not in AUTO_NORMALISATION]
+    if not_optimisable:
         raise ValueError(
-            "param_bounds is required because optimisation is performed in normalised space. "
-            "Provide bounds for 'mass', 'r0' if you are optimising these."
+            f"Parameters {not_optimisable} cannot be optimised. Please move them to fixed_params."
         )
- 
-    missing = []
-    for key in opt_params:        
-        if key == 'v_r0':
-            continue
-        if key not in param_bounds:
-                missing.append(key)
+
+    missing = [key for key in opt_params if key in USER_BOUNDED_PARAM_KEYS and key not in param_bounds]
     if missing:
         raise ValueError(
             "Missing bounds for optimised parameters: "
-            f"{missing}. Please add (min, max) entries for all parameters you want to optimise."
+            f"{missing}. Please add (min, max) entries in param_bounds for {list(USER_BOUNDED_PARAM_KEYS)} if you want to optimise them."
+        )
+
+    ignored = sorted(key for key in param_bounds if key not in USER_BOUNDED_PARAM_KEYS)
+    if ignored:
+        print(
+            f"Notice: Ignoring supplied bounds for {ignored}. Bounds are only needed for {list(USER_BOUNDED_PARAM_KEYS)}; "
+            "the normalisation of all other parameters is set automatically."
         )
 
     normalisation_spec = {}
     for key, value in opt_params.items():
-        if key == 'v_r0':
-            if key in param_bounds:
-                print("Notice: Ignoring user-supplied bounds for 'v_r0' since we use a softplus transform for this parameter instead of normalisation.")
+        auto = AUTO_NORMALISATION.get(key, {})
+        if 'scale' in auto:
+            scale = to_float64(auto['scale'])
+            lower_bound = to_float64(auto.get('min', -jnp.inf))
+            if bool(to_float64(value) < lower_bound):
+                raise ValueError(
+                    f"Initial value for '{key}' ({float(value)}) is below its minimum ({float(lower_bound)})."
+                )
+            normalisation_spec[key] = {
+                'offset': to_float64(0.0),
+                'scale': scale,
+                'clip_min': lower_bound / scale,
+                'clip_max': to_float64(jnp.inf),
+                'cyclic': False,
+            }
             continue
-        bounds = param_bounds[key]
+
+        bounds = auto['bounds'] if 'bounds' in auto else param_bounds[key]
         if not isinstance(bounds, (tuple, list)) or len(bounds) != 2:
             raise ValueError(
                 f"Bounds for '{key}' must be a 2-element (min, max) tuple."
@@ -421,36 +438,58 @@ def build_normalisation_spec(opt_params, param_bounds):
                 f"Bounds for '{key}' must satisfy min < max. Got ({float(lower_bound)}, {float(upper_bound)})"
             )
 
+        cyclic = bool(auto.get('cyclic', False))
         value = to_float64(value)
-        if not bool((value >= lower_bound) & (value <= upper_bound)):
+        if not cyclic and not bool((value >= lower_bound) & (value <= upper_bound)):
             raise ValueError(
                 f"Initial value for '{key}' ({float(value)}) is outside bounds"
                 f"({float(lower_bound)}, {float(upper_bound)})."
             )
 
-        scale = upper_bound - lower_bound
         normalisation_spec[key] = {
             'offset': lower_bound,
-            'scale': scale,
+            'scale': upper_bound - lower_bound,
+            'clip_min': to_float64(0.0),
+            'clip_max': to_float64(1.0),
+            'cyclic': cyclic,
         }
 
     return normalisation_spec
 
 
+def get_physical_bounds(opt_keys, param_bounds=None):
+    """(min, max) bounds in canonical units for each optimised parameter that has them:
+    user-supplied bounds for r0 and mass, and the AUTO_NORMALISATION bounds for the rest.
+    Parameters with only a minimum (v_r0) get (min, inf); parameters with neither (v_lsr) are left out.
+    Cyclic parameters (see is_cyclic_param) should be wrapped into these bounds rather than clipped."""
+    param_bounds = convert_and_strip_bound_units(param_bounds)
+    physical_bounds = {}
+    for key in opt_keys:
+        if key in USER_BOUNDED_PARAM_KEYS:
+            if key in param_bounds:
+                physical_bounds[key] = param_bounds[key]
+        elif 'bounds' in AUTO_NORMALISATION.get(key, {}):
+            physical_bounds[key] = tuple(float(b) for b in AUTO_NORMALISATION[key]['bounds'])
+        elif 'min' in AUTO_NORMALISATION.get(key, {}):
+            physical_bounds[key] = (float(AUTO_NORMALISATION[key]['min']), math.inf)
+    return physical_bounds
+
+
+def is_cyclic_param(key):
+    """True for parameters that wrap round their bounds (phi0, pa)"""
+    return bool(AUTO_NORMALISATION.get(key, {}).get('cyclic', False))
+
+
 def normalise_opt_params(opt_params, normalisation_spec):
-    """normalise optimised parameters to [0, 1], unless v_r0 which is transformed by softplus instead"""
+    """normalise optimised parameters to [0, 1] (parameters with (min, max) bounds; others are just rescaled).
+    Cyclic parameters are wrapped into [0, 1), so e.g. pa = -10 deg is accepted as 350 deg."""
     normalised = {}
     for key, value in opt_params.items():
-        if key == 'v_r0':
-            # save the value 'raw' such that v_r0 = softplus(raw)
-            value = to_float64(value)
-            if value < 0:
-                raise ValueError(f"v_r0 must be non-negative, got {float(value)}")
-            normalised[key] = inv_softplus(value)
-            continue
         offset = normalisation_spec[key]['offset']
         scale = normalisation_spec[key]['scale']
         normalised[key] = (to_float64(value) - offset) / scale
+        if normalisation_spec[key]['cyclic']:
+            normalised[key] = jnp.mod(normalised[key], 1.0)
     return normalised
 
 
@@ -458,14 +497,10 @@ def denormalise_opt_params(norm_opt_params, normalisation_spec):
     """Convert normalised optimised parameters back to physical/log parameter values"""
     denormalised = {}
     for key, value in norm_opt_params.items():
-        if key == 'v_r0':
-            denormalised[key] = softplus(to_float64(value))
-            continue
         offset = normalisation_spec[key]['offset']
         scale = normalisation_spec[key]['scale']
-        if key == 'phi0' or key == 'pa':
-            # special handling for phi0, pa because circular
-            denormalised[key] = jnp.mod(to_float64(value) * scale + offset, 2*jnp.pi)
+        if normalisation_spec[key]['cyclic']:
+            denormalised[key] = offset + jnp.mod(to_float64(value), 1.0) * scale
         else:
             denormalised[key] = to_float64(value) * scale + offset
     return denormalised
@@ -505,19 +540,12 @@ def rotation_param_from_mu(rotation_key, mu, mass, r0):
     elif rotation_key == 'omega':
         return stream_lines_grad.omega_from_mu(mu=mu, mass=mass, r0=r0)
 
-def with_mu_substituted(opt_params, fixed_params, param_bounds=None):
+def with_mu_substituted(opt_params, fixed_params):
     """ Replace the user's input rotation parameter (either rc or omega) with mu, which is the parameter used internally for the physics calculations and optimisation,
-    because it has obvious bounds (0,1) that will mean that optimisation won't explore regions where rc > r0.
-    
-    User should not have supplied bounds for 'rc' or 'omega', but if they did, prints a notice and ignores them.
-    (Because the optimisation is performed in mu space where the bounds should be (0,1))"""
+    because it has obvious bounds (0,1) that will mean that optimisation won't explore regions where rc > r0."""
     rotation_key = get_rotation_param_key(opt_params, fixed_params)
     opt_params = dict(opt_params)
     fixed_params = dict(fixed_params)
-    if param_bounds is not None:
-        param_bounds = dict(param_bounds)
-    else:
-        param_bounds = {}
 
     all_params = {**fixed_params, **opt_params}
     mass = all_params['mass']
@@ -528,14 +556,6 @@ def with_mu_substituted(opt_params, fixed_params, param_bounds=None):
         mu_value = mu_from_rotation_param(rotation_key, rotation_value, mass, r0)
         del opt_params[rotation_key]
         opt_params['mu'] = mu_value
-        # drop any rc/omega/mu bounds the user supplied, we use (0,1) bounds for mu
-        if rotation_key in param_bounds:
-            print(
-                f"Notice: Ignoring user-supplied bounds for '{rotation_key}', since the optimisation is performed in 'mu' space. "
-                f"Using (0, 1) bounds for 'mu' instead."
-            )
-            del param_bounds[rotation_key]
-        param_bounds['mu'] = (0.0+1e-6, 1.0-1e-6) # tiny epsilon to avoid rc=r0 or rc=0
     else:
         # rotation parameter is in fixed params. so just rename it to 'mu' in fixed params for consistency
         rotation_value = fixed_params[rotation_key]
@@ -543,23 +563,7 @@ def with_mu_substituted(opt_params, fixed_params, param_bounds=None):
         del fixed_params[rotation_key]
         fixed_params['mu'] = mu_value
     
-    return opt_params, fixed_params, param_bounds, rotation_key
-
-def auto_fill_angle_bounds(opt_params, param_bounds):
-    """Automatically fill in bounds for theta0, phi0, inc, pa, since their ranges are fixed by physics.
-    If the user supplied bounds for these parameters by mistake, print a notice and ignore them."""
-    if param_bounds is None:
-        param_bounds = {}
-    else:
-        param_bounds = dict(param_bounds)
-    for key, auto_bounds in ANGLE_BOUNDS_RAD.items():
-        if key not in opt_params:
-            continue
-        if key in param_bounds:
-            print(f"Notice: Ignoring supplied bounds for '{key}', since the bounds are fixed by physics. Using automatic bounds ({math.degrees(auto_bounds[0])} - {math.degrees(auto_bounds[1])} degrees).")
-        param_bounds[key] = auto_bounds
-
-    return param_bounds
+    return opt_params, fixed_params, rotation_key
 
 def format_param(key, value):
     """
@@ -762,6 +766,33 @@ def gradient_l2_norm(grad_tree):
     for grad_leaf in grad_leaves:
         grad_sum_sq = grad_sum_sq + jnp.sum(jnp.square(grad_leaf))
     return jnp.sqrt(grad_sum_sq)
+
+def find_active_bounds(norm_opt_params, norm_grads, normalisation_spec):
+    """Find optimised parameters sitting on a clip bound with the gradient pushing them further past it.
+    There the constrained minimum is on the bound rather than at a stationary point, so the gradient
+    component for that parameter never reaches zero, and the quadratic (Hessian) approximation does not
+    describe it. Cyclic parameters have no bounds.
+
+    Returns dict {param key: 'lower' or 'upper'}"""
+    active_bounds = {}
+    for key, spec in normalisation_spec.items():
+        if spec['cyclic'] or key not in norm_opt_params:
+            continue
+        value = float(norm_opt_params[key])
+        grad = float(norm_grads[key])
+        # gradient descent moves along -grad
+        if value <= float(spec['clip_min']) and grad > 0:
+            active_bounds[key] = 'lower'
+        elif value >= float(spec['clip_max']) and grad < 0:
+            active_bounds[key] = 'upper'
+    return active_bounds
+
+
+def projected_gradient_l2_norm(norm_grads, active_bounds):
+    """L2 norm of the gradient, excluding parameters held at an active bound (see find_active_bounds),
+    whose gradient components cannot go to zero."""
+    return gradient_l2_norm({key: grad for key, grad in norm_grads.items() if key not in active_bounds})
+
 
 @jax.jit(static_argnames=("npoints",))
 def forward_model(model_params, distance_pc, npoints=1e6):
@@ -1601,7 +1632,10 @@ def fit_streamline(initial_opt_params, fixed_params, streamer, distance_pc,
         Adam learning rate applied uniformly to all normalised parameters.
     param_bounds : dict or None
         Parameter bounds in physical/log parameter units.
-        Parameters that require bounds here (if optimised): r0, mass, inc, pa
+        Only r0 and mass need bounds (if optimised). All other parameters are normalised automatically
+        (see AUTO_NORMALISATION): angles and mu use their physical ranges, v_r0 is kept >= 0
+        with no upper bound, and v_lsr is unbounded.
+        Bounds supplied for any other parameter are ignored.
         Provide param_bounds as a dictionary with values as (min, max) tuples for each parameter
     n_epochs : int
         Maximum number of optimisation iterations
@@ -1639,7 +1673,8 @@ def fit_streamline(initial_opt_params, fixed_params, streamer, distance_pc,
         If provided, optimisation stops when the L2 norm of gradients with
         respect to normalised parameters
         is less than this threshold for gradient_tol_epochs consecutive epochs,
-        indicating convergence.
+        indicating convergence. Parameters held at a bound, with the gradient pushing
+        past it, are left out of the norm since their gradient cannot go to zero.
     gradient_tol_epochs : int
         Number of consecutive epochs with ||grad|| < gradient_tol required to
         trigger normalised-space gradient norm-based early stopping. Must be >= 1.
@@ -1655,7 +1690,10 @@ def fit_streamline(initial_opt_params, fixed_params, streamer, distance_pc,
     FitResult namedtuple with fields:
     - best_opt_params : dict of best-fit optimised parameters (physical/log units)
     - loss_history : list of loss values at each epoch (float)
-    - param_errors: dict of estimated 1-sigma uncertainties for each optimised parameter in the display parameterisation (or None if uncertainty estimation failed)
+    - param_errors: dict of estimated 1-sigma uncertainties for each optimised parameter in the display parameterisation (or None if uncertainty estimation failed).
+      Parameters in at_bound are left out.
+    - at_bound: dict {param name: 'lower' or 'upper'} of parameters that finished on a bound with the loss still pushing past it.
+      They are held fixed at the bound when estimating the other uncertainties, and have zero variance in the covariance.
     - covariance_result: CovarianceResult or None: full covariance information needed for sampling, or None if estimation failed. Fields:
         - covariance : 2D array of covariance matrix in physical/log units
         - opt_keys: list of parameter keys corresponding to covariance_matrix rows/columns
@@ -1684,10 +1722,7 @@ def fit_streamline(initial_opt_params, fixed_params, streamer, distance_pc,
     # we perform optimisation in mu-space when either rc or omega is present. conversion is here
     # rotation_key records which of 'rc', 'omega', or 'mu' is input as rotation parameter by user, 
     # so we know which one to convert back to at the end
-    opt_params, fixed_params, param_bounds, rotation_key = with_mu_substituted(opt_params, fixed_params, param_bounds)
-
-    # add bounds for angles if they are being optimised
-    param_bounds = auto_fill_angle_bounds(opt_params, param_bounds)
+    opt_params, fixed_params, rotation_key = with_mu_substituted(opt_params, fixed_params)
 
     # check priors are valid and match optimised parameters
     validated_priors = validate_priors(priors, opt_params, fixed_params)
@@ -1781,6 +1816,7 @@ def fit_streamline(initial_opt_params, fixed_params, streamer, distance_pc,
     best_loss = initial_loss
     best_opt_params = opt_params.copy()
     best_opt_params_norm = opt_params_norm.copy()
+    best_active_bounds = {}
     best_epoch = 0
     patience_counter = 0
     loss_threshold_counter = 0
@@ -1878,7 +1914,8 @@ def fit_streamline(initial_opt_params, fixed_params, streamer, distance_pc,
         # Compute initial loss and trace
         (loss_value_trace, (loss_trace_raw, _)), norm_grads_trace = loss_and_grad_fn(opt_params_norm)
         loss_trace = trace_tree_to_python(loss_trace_raw)
-        grad_norm = float(gradient_l2_norm(norm_grads_trace))
+        active_bounds = find_active_bounds(opt_params_norm, norm_grads_trace, normalisation_spec)
+        grad_norm = float(projected_gradient_l2_norm(norm_grads_trace, active_bounds))
         
         # Build and write trace row for epoch 0
         trace_row = build_trace_row(0, float(loss_value_trace), loss_trace, grad_norm, loss_method)
@@ -1901,20 +1938,12 @@ def fit_streamline(initial_opt_params, fixed_params, streamer, distance_pc,
 
             # Enforce normalised bounds and map back to physical/log values.
             for key in opt_param_keys:
-                if key == 'phi0':
-                    # phi0 is cyclic; wrap to [0, 1) in normalised space
+                spec = normalisation_spec[key]
+                if spec['cyclic']:
+                    # phi0, pa are cyclic; wrap to [0, 1) in normalised space
                     opt_params_norm[key] = jnp.mod(opt_params_norm[key], 1.0)
-                elif key == 'rc':
-                    # must be positive >0
-                    opt_params_norm[key] = jnp.clip(opt_params_norm[key], to_float64(1e-6), 1.0)
-                elif key == 'omega':
-                    # must be positive >0
-                    opt_params_norm[key] = jnp.clip(opt_params_norm[key], to_float64(1e-6), 1.0)
-                elif key == 'v_r0':
-                    #already dealt with
-                    continue
                 else:
-                    opt_params_norm[key] = jnp.clip(opt_params_norm[key], 0.0, 1.0)
+                    opt_params_norm[key] = jnp.clip(opt_params_norm[key], spec['clip_min'], spec['clip_max'])
 
             # Now materialize physical parameters from the (possibly clamped)
             # normalised parameters.
@@ -1922,8 +1951,9 @@ def fit_streamline(initial_opt_params, fixed_params, streamer, distance_pc,
 
             # Compute loss and gradient at the post-update state S(epoch) for logging 
             (loss_value, (loss_trace_raw, err)), norm_grads = loss_and_grad_fn(opt_params_norm)
-            # print the gradients by parameter for debugging
-            grad_norm = float(gradient_l2_norm(norm_grads))
+            # parameters held at a bound can't reach zero gradient, so leave them out of the convergence check
+            active_bounds = find_active_bounds(opt_params_norm, norm_grads, normalisation_spec)
+            grad_norm = float(projected_gradient_l2_norm(norm_grads, active_bounds))
 
             # raise any errors
             error_message = get_checkify_error_message(err)
@@ -1967,6 +1997,7 @@ def fit_streamline(initial_opt_params, fixed_params, streamer, distance_pc,
                 best_loss = loss_value
                 best_opt_params = opt_params.copy()
                 best_opt_params_norm = opt_params_norm.copy()
+                best_active_bounds = active_bounds
                 best_epoch = epoch
                 patience_counter = 0
             else:
@@ -2048,6 +2079,7 @@ def fit_streamline(initial_opt_params, fixed_params, streamer, distance_pc,
             normalisation_spec=normalisation_spec,
             best_norm_opt_params=best_opt_params_norm,
             rotation_key=key_needs_transform,
+            active_bounds=best_active_bounds,
             npoints=npoints,
             priors_keys=priors_keys,
             priors_means=priors_means,
@@ -2061,6 +2093,7 @@ def fit_streamline(initial_opt_params, fixed_params, streamer, distance_pc,
     display_opt_params = dict(ordered_best_opt_params)
     display_fixed_params = dict(fixed_params)
     display_param_errors = dict(param_errors) if param_errors is not None else None
+    display_at_bound = dict(best_active_bounds)
 
     if cov_transformed_dict is not None and key_needs_transform is not None and display_param_errors is not None:
         if key_needs_transform in cov_transformed_dict['keys']:
@@ -2070,18 +2103,27 @@ def fit_streamline(initial_opt_params, fixed_params, streamer, distance_pc,
             r0_val   = float(all_params_for_transform['r0'])
             display_opt_params[key_needs_transform] = rotation_param_from_mu(key_needs_transform, mu_best, mass_val, r0_val)
             display_opt_params.pop('mu', None)
-            display_param_errors[key_needs_transform] = cov_transformed_dict['errors'][key_needs_transform]
+            if key_needs_transform in cov_transformed_dict['errors']:
+                display_param_errors[key_needs_transform] = cov_transformed_dict['errors'][key_needs_transform]
             display_param_errors.pop('mu', None)
+            if 'mu' in display_at_bound:
+                display_at_bound[key_needs_transform] = display_at_bound.pop('mu')
 
     print("\nFinal parameters at best-fit:")
     all_display_params = {**display_fixed_params, **display_opt_params}
     for key in all_display_params.keys():
         value = all_display_params[key]
-        if display_param_errors is not None and key in display_param_errors:
+        if key in display_at_bound:
+            print(f"  {key}: {format_param(key, value)} (at {display_at_bound[key]} bound, no uncertainty)")
+        elif display_param_errors is not None and key in display_param_errors:
             error = display_param_errors[key]
             print(f"  {key}: {format_param(key, value)} ± {format_param(key, error)}")
         else:
             print(f"  {key}: {format_param(key, value)}")
+    if display_at_bound:
+        print(
+            f"Note: {list(display_at_bound)} finished on a bound, so held fixed for estimating the other uncertainties. "
+        )
 
     if save_folder is not None:
         outputs.save_best_fit_params(
@@ -2089,6 +2131,7 @@ def fit_streamline(initial_opt_params, fixed_params, streamer, distance_pc,
             display_fixed_params,
             display_param_errors,
             save_folder=save_folder,
+            at_bound=display_at_bound,
         )
 
     # now we will make some plots of the results
@@ -2128,4 +2171,5 @@ def fit_streamline(initial_opt_params, fixed_params, streamer, distance_pc,
         loss_history=loss_history,
         param_errors=display_param_errors,
         covariance_result=cov_result,
+        at_bound=display_at_bound,
     )

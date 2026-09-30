@@ -239,16 +239,20 @@ def plot_fitting_results(
             plot_cov    = cov_matrix
             plot_errors = param_errors
         param_vals = np.array([float(ordered_best_opt_params.get(k, 0.0)) for k in opt_param_keys], dtype=float)
-        param_errs = np.array([float(plot_errors[k]) for k in plot_keys], dtype=float)
+        # parameters held at a bound have no error (nan: no bar plotted)
+        param_errs = np.array([float(plot_errors.get(k, np.nan)) for k in plot_keys], dtype=float)
         plot_param_uncertainties(plot_keys, param_vals, param_errs, save_folder=save_folder, show=show_plots)
         plot_param_correlations(plot_keys, plot_cov, save_folder=save_folder, show=show_plots)
 
 
-def save_best_fit_params(best_opt_params, fixed_params, param_errors, save_folder='sting_results'):
+def save_best_fit_params(best_opt_params, fixed_params, param_errors, save_folder='sting_results', at_bound=None):
     """
     saves parameters from the best-fit epoch (lowest loss) and their uncertainties 
-    (when available, fixed params will not have uncertainties) to a JSON
+    (when available, fixed params will not have uncertainties) to a JSON.
+    at_bound: optional dict {param: 'lower' or 'upper'} of optimised parameters that finished on a bound
+    (these have no uncertainty), saved as 'at_bound' in that parameter's entry.
     """
+    at_bound = {} if at_bound is None else at_bound
     output_path = os.path.join(save_folder, 'best_fit_params.json')
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
  
@@ -269,6 +273,8 @@ def save_best_fit_params(best_opt_params, fixed_params, param_errors, save_folde
             else:
                 display_err = raw_err
             entry['sigma'] = display_err
+        if raw_key in at_bound:
+            entry['at_bound'] = at_bound[raw_key]
         optimised_section[display_key] = entry
  
     # parameters that were fixed (no uncertainties)
@@ -1463,8 +1469,12 @@ def plot_param_correlations(param_names, covariance, annotate=True, save_folder=
     '''
     cov_np = np.array(covariance, dtype=float)
 
-    diag = np.sqrt(np.clip(np.diag(cov_np), 1e-30, None))
-    corr = cov_np / np.outer(diag, diag)
+    # zero-variance parameters (held fixed at a bound) have undefined correlations: shown blank
+    diag = np.sqrt(np.clip(np.diag(cov_np), 0.0, None))
+    with np.errstate(divide='ignore', invalid='ignore'):
+        corr = cov_np / np.outer(diag, diag)
+    corr[diag == 0.0, :] = np.nan
+    corr[:, diag == 0.0] = np.nan
     corr = np.clip(corr, -1.0, 1.0)
 
     fig, ax = plt.subplots(figsize=(6.5, 5.5))
@@ -1487,6 +1497,8 @@ def plot_param_correlations(param_names, covariance, annotate=True, save_folder=
     if annotate:
         for i in range(len(param_names)):
             for j in range(len(param_names)):
+                if not np.isfinite(corr[i, j]):
+                    continue
                 ax.text(
                     j, i,
                     f'{corr[i, j]:.2f}',
@@ -1706,12 +1718,14 @@ def sample_parameter_sets_from_covariance(best_params, covariance, opt_keys, par
         cov,
         size=n_samples,
     )
-    param_bounds = gradient_descent.auto_fill_angle_bounds(set(opt_keys), param_bounds)
-    param_bounds = gradient_descent.convert_and_strip_bound_units(param_bounds)
+    param_bounds = gradient_descent.get_physical_bounds(opt_keys, param_bounds)
     for j, key in enumerate(opt_keys):
         if key in param_bounds:
             low, high = param_bounds[key]
-            samples[:, j] = np.clip(samples[:, j], low, high)
+            if gradient_descent.is_cyclic_param(key):
+                samples[:, j] = low + np.mod(samples[:, j] - low, high - low)
+            else:
+                samples[:, j] = np.clip(samples[:, j], low, high)
 
     return samples
 

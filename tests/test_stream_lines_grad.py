@@ -10,7 +10,7 @@ without stubs or real observational data:
   - build_rotation_matrix: orthogonality and identity limits
   - rotate_xyz: invertibility and zero-rotation identity
   - get_orb_ang / get_theta / get_dphi: orbital angle geometry
-  - build_stream_quantities: StreamState fields and v_r0=0 guard
+  - build_stream_quantities: StreamState fields, closed-form orb_ang0, smoothness through v_r0=0
   - xyz_stream: output shapes, output-size rule (npoints), valid mask,
     zero-rotation symmetry, and check_r_array guard
 
@@ -23,6 +23,7 @@ Run with:
 
 import math
 
+import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
@@ -41,7 +42,7 @@ eps        = slg.eps
 # ---------------------------------------------------------------------------
 _BASE = dict(
     mass=1.0, r0=1000.0, theta0=math.radians(30), phi0=math.radians(15),
-    mu=0.3, v_r0=-2.0, inc=0.0, pa=0.0, rmin=20.0, deltar=50.0, npoints=30,
+    mu=0.3, v_r0=2.0, inc=0.0, pa=0.0, rmin=20.0, deltar=50.0, npoints=30,
 )
 
 
@@ -383,7 +384,7 @@ class TestBuildStreamQuantities:
     """Unit tests for the StreamState precomputation."""
 
     def _build(self, **kwargs):
-        defaults = dict(mass=1.0, r0=1000.0, theta0=math.radians(30), mu=0.3, v_r0=-2.0)
+        defaults = dict(mass=1.0, r0=1000.0, theta0=math.radians(30), mu=0.3, v_r0=2.0)
         defaults.update(kwargs)
         return slg.build_stream_quantities(**defaults)
 
@@ -401,7 +402,7 @@ class TestBuildStreamQuantities:
 
     def test_ecc_at_least_one_for_parabolic_orbit(self):
         """For a typical infalling streamer the eccentricity should be >= 1."""
-        state = self._build(v_r0=-2.0, mu=0.3)
+        state = self._build(v_r0=2.0, mu=0.3)
         assert float(state.ecc) >= 0.0  # ecc can be < 1 for low v_r0; just check finite
         assert math.isfinite(float(state.ecc))
 
@@ -416,10 +417,38 @@ class TestBuildStreamQuantities:
         assert pytest.approx(float(state.vk0), rel=1e-9) == expected_vk0
 
     def test_zero_v_r0_does_not_produce_nan(self):
-        """v_r0=0 is guarded by an epsilon replacement; no NaN should appear."""
+        """v_r0=0 (apocentre at r0) is handled exactly; no NaN should appear."""
         state = self._build(v_r0=0.0)
         for field in state:
             assert math.isfinite(float(field)), f"NaN/Inf in StreamState field"
+        assert float(state.orb_ang0) == 0.0
+
+    def test_ecc_matches_epsilon_form(self):
+        """ecc = sqrt(1 + epsilon sin^2(theta0)) (Mendoza+2009) for any v_r0."""
+        for v in [-2.0, 0.0, 0.5, 2.0]:
+            state = self._build(v_r0=v)
+            expected = math.sqrt(1.0 + float(state.epsilon) * math.sin(math.radians(30)) ** 2)
+            assert pytest.approx(float(state.ecc), rel=1e-12) == expected
+
+    def test_orb_ang0_matches_arccos_for_infall(self):
+        """For v_r0 > 0 the closed form agrees with the arccos orbit equation at r0."""
+        state = self._build(v_r0=2.0)
+        expected = float(slg.get_orb_ang(r_to_rc=1.0 / 0.3, theta0=math.radians(30), ecc=state.ecc))
+        assert pytest.approx(float(state.orb_ang0), rel=1e-9) == expected
+
+    def test_orb_ang0_is_odd_in_v_r0(self):
+        pos = float(self._build(v_r0=1.5).orb_ang0)
+        neg = float(self._build(v_r0=-1.5).orb_ang0)
+        assert pos > 0
+        assert pytest.approx(neg, rel=1e-12) == -pos
+
+    def test_orb_ang0_gradient_finite_and_nonzero_at_zero(self):
+        """orb_ang0 is smooth through v_r0=0 (no |v_r0| kink, no clipped arccos)."""
+        grad_fn = jax.grad(lambda v: self._build(v_r0=v).orb_ang0)
+        g0 = float(grad_fn(0.0))
+        assert math.isfinite(g0) and g0 > 0
+        assert pytest.approx(float(grad_fn(1e-6)), rel=1e-6) == g0
+        assert pytest.approx(float(grad_fn(-1e-6)), rel=1e-6) == g0
 
     def test_nu_finite_for_typical_params(self):
         state = self._build()
@@ -545,8 +574,20 @@ class TestXyzStream:
         pos, vel, mask = self._run(npoints=2, r0=200.0, rmin=40.0, deltar=160.0)
         assert mask.shape == (2,)
 
+    def test_gradient_wrt_v_r0_continuous_through_zero(self):
+        """The streamline is differentiable in v_r0 at 0, with matching one-sided gradients."""
+        def summary(v):
+            pos, vel, mask = self._run(v_r0=v, inc=0.3, pa=0.2)
+            w = mask.astype(jnp.float64)
+            return jnp.sum(w * pos[0]) + jnp.sum(w * vel[1])
+        grad_fn = jax.grad(summary)
+        g0 = float(grad_fn(0.0))
+        assert math.isfinite(g0) and g0 != 0.0
+        assert pytest.approx(float(grad_fn(1e-6)), rel=1e-4) == g0
+        assert pytest.approx(float(grad_fn(-1e-6)), rel=1e-4) == g0
+
     def test_zero_v_r0_does_not_raise(self):
-        """v_r0=0 is guarded internally; should not produce NaN or raise."""
+        """v_r0=0 is a valid input; should not produce NaN or raise."""
         pos, vel, mask = self._run(v_r0=0.0)
         valid = np.array(mask).astype(bool)
         for arr in list(pos) + list(vel):
