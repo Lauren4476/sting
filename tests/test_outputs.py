@@ -69,6 +69,7 @@ import sting.outputs as outputs_module
 # Bring the public names into this namespace for convenience
 param_for_display = outputs_module.param_for_display
 save_best_fit_params = outputs_module.save_best_fit_params
+save_best_fit_trajectory = outputs_module.save_best_fit_trajectory
 _ensure_clean_dir = outputs_module._ensure_clean_dir
 _opt_params_from_log = outputs_module._opt_params_from_log
 plot_loss = outputs_module.plot_loss
@@ -174,6 +175,39 @@ class TestParamForDisplay:
         # value should always come back as a plain Python float
         _, val, _ = param_for_display("r0", np.float32(3.14))
         assert isinstance(val, float)
+
+
+# ===========================================================================
+# save_best_fit_trajectory
+# ===========================================================================
+
+class TestSaveBestFitTrajectory:
+    """Tests for save_best_fit_trajectory – CSV of the best-fit model curve."""
+
+    def test_offsets_and_velocity_written(self, tmp_path):
+        ra = np.array([10.0, 5.0, np.nan, 1.0])
+        dec = np.array([2.0, 1.0, 0.5, 0.1])
+        v = np.array([7.0, 7.5, 8.0, 9.0])
+        path = save_best_fit_trajectory(ra, dec, v, 140.0, save_folder=str(tmp_path))
+        df = pd.read_csv(path, comment="#")
+        assert list(df.columns) == ["ra_offset_arcsec", "dec_offset_arcsec", "v_lsr_kms"]
+        # the non-finite point is dropped
+        np.testing.assert_allclose(df["ra_offset_arcsec"], [10.0, 5.0, 1.0])
+        np.testing.assert_allclose(df["v_lsr_kms"], [7.0, 7.5, 9.0])
+
+    def test_absolute_coords_match_offsets(self, tmp_path):
+        from astropy.coordinates import SkyCoord
+        import astropy.units as u
+        centre = SkyCoord(52.0 * u.deg, 31.0 * u.deg, frame="icrs")
+        ra = np.array([30.0, -12.0])
+        dec = np.array([-20.0, 8.0])
+        path = save_best_fit_trajectory(ra, dec, np.zeros(2), 300.0,
+                                        save_folder=str(tmp_path), yso_centre=centre)
+        df = pd.read_csv(path, comment="#")
+        sky = SkyCoord(df["ra_deg"].values * u.deg, df["dec_deg"].values * u.deg, frame="icrs")
+        dra, ddec = centre.spherical_offsets_to(sky)
+        np.testing.assert_allclose(dra.to(u.arcsec).value, ra, atol=1e-6)
+        np.testing.assert_allclose(ddec.to(u.arcsec).value, dec, atol=1e-6)
 
 
 # ===========================================================================

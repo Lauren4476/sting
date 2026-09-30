@@ -158,9 +158,11 @@ def plot_fitting_results(
     matching_method='legacy',
     matching_iterations=gradient_descent.MATCHING_ITERATIONS,
     integration_nodes=gradient_descent.INTEGRATION_NODES,
+    yso_centre=None,
 ):
     """
     Generate and save the followingbest-fit diagnostic plots to save_folderafter optimisation:
+    - best_fit_trajectory.csv   : best-fit model RA/Dec/velocity along the streamline (see save_best_fit_trajectory)
     - loss_history.png          : loss vs epoch
     - best_fit_morphology.png   : RA/Dec best fit
     - best_fit_vel_radius.png   : velocity-radius best fit
@@ -183,6 +185,7 @@ def plot_fitting_results(
     show_plots : bool, whether to display plots (in addition to saving). Default False
     transformed_cov_result: dict or None. keys expected: 'keys', 'cov', 'errors'.
     by_eye_params: dict or None, optional by-eye parameter guess (with the same params as order_best_opt_params). If provided, will be plotted alongside the best-fit model in the morphology and velocity-radius plots.
+    yso_centre: astropy SkyCoord or None, star position. If given, absolute RA/Dec are added to best_fit_trajectory.csv
     """
  
     ra_data, dec_data, v_data = streamer.data
@@ -197,6 +200,11 @@ def plot_fitting_results(
         by_eye_params=by_eye_params, streamer=streamer,
         matching_method=matching_method, matching_iterations=matching_iterations,
         integration_nodes=integration_nodes,
+    )
+
+    save_best_fit_trajectory(
+        best_fit['ra_model'], best_fit['dec_model'], best_fit['v_model'], distance_pc,
+        save_folder=save_folder, yso_centre=yso_centre,
     )
 
     plot_morphology(
@@ -298,6 +306,58 @@ def save_best_fit_params(best_opt_params, fixed_params, param_errors, save_folde
  
     with open(output_path, 'w') as file:
         json.dump(output, file, indent=4)
+
+
+def save_best_fit_trajectory(ra_model, dec_model, v_model, distance_pc, save_folder='sting_results', yso_centre=None):
+    """
+    Save the best-fit model trajectory to best_fit_trajectory.csv, for plotting the streamer over maps
+    outside of sting. Points run along the streamline in the order the model is sampled (from r0 inwards).
+
+    Columns:
+    - ra_offset_arcsec, dec_offset_arcsec : sky offsets from the star (east and north positive, the same
+      convention as extract_streamline.reduce_to_1D)
+    - v_lsr_kms : line-of-sight velocity (km/s, LSR, includes the v_lsr parameter)
+    - ra_deg, dec_deg : absolute ICRS coordinates, only written if yso_centre is given
+
+    Lines starting with '#' are metadata, so the file can be read with e.g.
+    pandas.read_csv(path, comment='#') or numpy.genfromtxt(path, delimiter=',', names=True, comments='#').
+
+    yso_centre : astropy SkyCoord or None, the star position used to make the offsets in reduce_to_1D
+    """
+    ra_model = np.asarray(ra_model, dtype=float)
+    dec_model = np.asarray(dec_model, dtype=float)
+    v_model = np.asarray(v_model, dtype=float)
+    finite = np.isfinite(ra_model) & np.isfinite(dec_model) & np.isfinite(v_model)
+
+    columns = {
+        'ra_offset_arcsec': ra_model[finite],
+        'dec_offset_arcsec': dec_model[finite],
+        'v_lsr_kms': v_model[finite],
+    }
+    header = [
+        '# sting best-fit streamline trajectory',
+        '# ra_offset_arcsec, dec_offset_arcsec: offsets from the star (east, north positive)',
+        '# v_lsr_kms: line-of-sight velocity in km/s (LSR)',
+        f'# distance_pc: {float(distance_pc)}',
+        '# points ordered along the streamline from r0 inwards',
+    ]
+
+    if yso_centre is not None:
+        from astropy import units as u
+        centre = yso_centre.icrs
+        sky = centre.spherical_offsets_by(columns['ra_offset_arcsec'] * u.arcsec,
+                                          columns['dec_offset_arcsec'] * u.arcsec)
+        columns['ra_deg'] = sky.ra.deg
+        columns['dec_deg'] = sky.dec.deg
+        header.insert(3, '# ra_deg, dec_deg: absolute ICRS coordinates (degrees)')
+        header.insert(-1, f'# yso_centre_icrs_deg: {centre.ra.deg:.10f}, {centre.dec.deg:.10f}')
+
+    output_path = os.path.join(save_folder, 'best_fit_trajectory.csv')
+    os.makedirs(save_folder, exist_ok=True)
+    with open(output_path, 'w') as file:
+        file.write('\n'.join(header) + '\n')
+        pd.DataFrame(columns).to_csv(file, index=False, float_format='%.12g')
+    return output_path
 
 
 def _ensure_clean_dir(path):

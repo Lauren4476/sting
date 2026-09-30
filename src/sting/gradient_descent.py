@@ -1961,6 +1961,7 @@ def fit_streamline(initial_opt_params, fixed_params, streamer, distance_pc,
                    point_sigma_dec=None,
                    point_sigma_v=None,
                    point_cloud_loss_scale=None,
+                   yso_centre=None,
                    ):
     """
     Fit streamline model parameters to data using Adam optimiser.
@@ -2056,6 +2057,9 @@ def fit_streamline(initial_opt_params, fixed_params, streamer, distance_pc,
         trigger normalised-space gradient norm-based early stopping. Must be >= 1.
     show_plots : bool
         Whether to show diagnostic plots during optimisation
+    yso_centre : astropy SkyCoord or None
+        Star position (the same one passed to extract_streamline.reduce_to_1D). If given, absolute
+        RA/Dec (deg) are added to best_fit_trajectory.csv alongside the offsets from the star.
         
     Epoch 0: initial state before any updates, with initial_opt_params
     Epoch n (n>=1): state after applying parameter update n
@@ -2540,6 +2544,7 @@ def fit_streamline(initial_opt_params, fixed_params, streamer, distance_pc,
             matching_method=matching_method,
             matching_iterations=matching_iterations,
             integration_nodes=integration_nodes,
+            yso_centre=yso_centre,
         )
 
     # save results to CovarianceResult and FitResult namedtuples
