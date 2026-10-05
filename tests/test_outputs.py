@@ -1208,3 +1208,61 @@ def test_by_epoch_prepares_once_and_saves_incrementally(
 
     assert prepare_calls == [(streamer, "continuous")]
     assert events == [("evaluate", 10.0), ("plot", 0), ("evaluate", 11.0), ("plot", 1)]
+
+
+# ===========================================================================
+# spin = -1 through the real fit, saved parameters and per-epoch plots
+# ===========================================================================
+
+def _counter_rotating_streamer(gd_real, n=10):
+    import jax.numpy as jnp
+    params = {
+        "mass": 1.0, "r0": 1500.0, "theta0": 0.7, "phi0": 3.5, "mu": 0.2, "v_r0": 0.5,
+        "inc": -0.5, "pa": 2.0, "rmin": 20.0, "deltar": 0.1, "v_lsr": 0.0, "spin": -1.0,
+    }
+    delta = jnp.linspace(0.0, 1.4, n)
+    ra, dec, v, _ = gd_real.stream_lines_grad.forward_model_at_delta(delta, params, 300.0)
+    sigma = jnp.full(n, 0.3)
+    streamer = types.SimpleNamespace(
+        pc_coords=jnp.stack((ra, dec, v, jnp.ones(n))), ra_data=ra, dec_data=dec, v_data=v,
+        ra_sigma=sigma, dec_sigma=sigma, v_sigma=sigma,
+        data=(ra, dec, v), uncertainties=(sigma, sigma, sigma),
+    )
+    return streamer, params
+
+
+def test_counter_rotating_fit_saves_spin_and_plots_by_epoch(tmp_path, monkeypatch):
+    # outputs_module was imported by the real sting package before the stubs above, so it uses the real modules
+    gd_real = outputs_module.gradient_descent
+    streamer, params = _counter_rotating_streamer(gd_real)
+    opt_params = {"phi0": 3.45}
+    fixed_params = {k: v for k, v in params.items() if k not in opt_params}
+    monkeypatch.setattr(plt, "show", lambda *args, **kwargs: None)
+    gd_real.fit_streamline(
+        opt_params, fixed_params, streamer, 300.0, n_epochs=2, info_every=100,
+        save_folder=str(tmp_path), loss_method=0, matching_method="integrated",
+    )
+
+    saved = json.loads((tmp_path / "best_fit_params.json").read_text())
+    assert saved["fixed_parameters"]["spin"] == {"value": -1.0, "unit": ""}
+
+    seen_spins = []
+    real_evaluate = outputs_module._evaluate_epoch_match
+
+    def recording_evaluate(model_params, *args, **kwargs):
+        seen_spins.append(float(model_params["spin"]))
+        return real_evaluate(model_params, *args, **kwargs)
+
+    monkeypatch.setattr(outputs_module, "_evaluate_epoch_match", recording_evaluate)
+    for function_name, extra_kwargs in (
+        ("plot_morphology_by_epoch", {"n_points": 10}),
+        ("plot_ra_vel_by_epoch", {}),
+        ("plot_dec_vel_by_epoch", {}),
+        ("plot_vel_radius_by_epoch", {}),
+    ):
+        getattr(outputs_module, function_name)(
+            gd_real, fixed_params, opt_params, 300.0, streamer=streamer,
+            save_folder=str(tmp_path), matching_method="integrated", **extra_kwargs,
+        )
+    # 3 epochs (0, 1, 2) for each of the 4 functions
+    assert seen_spins == [-1.0] * 12

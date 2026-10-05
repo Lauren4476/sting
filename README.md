@@ -119,6 +119,7 @@ fixed_params = {
     'rmin': 50.0 * u.au,
     'deltar': 30.0 * u.au,
     'v_lsr': v_lsr * u.km / u.s,
+    'spin': 1,  # optional, fixed only: +1 co-rotating (default) or -1 counter-rotating about the (inc, pa) axis
 }
 model_params, initial_opt_params, fixed_params = gradient_descent.prepare_model_params(
     initial_opt_params, fixed_params
@@ -178,7 +179,33 @@ Common degeneracies:
 
 As a result, when both parameters in one of these pairs are allowed to vary optimisation may converge more slowly as the optimiser drifts along a nearly-flat direction, and **uncertainty estimates will become large**.
 
+With `inc` and `pa` fixed, each value of `spin` covers one hemisphere of angular-momentum directions relative to the rotation axis: L̂·axis > 0 for `spin = +1` and L̂·axis < 0 for `spin = -1` (see [Counter-rotating streamers](#counter-rotating-streamers)).
+
 STING supports Gaussian priors on any optimisable parameter, specified as (mean, sigma). These are included in the loss function as additional chi-squared penalty terms, penalising the optimiser for adjusting parameters further from the prior mean. Where independent constraints are available from previous work, **I recommend applying priors to `mass`, `inc`, and `pa`**. This helps constrain otherwise degenerate parameter combinations and reduces uncertainties.
+
+### Counter-rotating streamers
+
+The rotation parameter (`omega`, `rc` or `mu`) is a **magnitude** and must be positive. The sense of rotation is set separately by `spin`, the rotation sense about the axis given by `inc` and `pa`:
+
+- `spin = +1` (default): co-rotating, the [Mendoza et al. (2009)](https://doi.org/10.1111/j.1365-2966.2008.14210.x) convention. The streamer's angular momentum lies within 90° of the axis.
+- `spin = -1`: counter-rotating. This is the mirror image φ → −φ of the standard streamline, so the angular momentum lies more than 90° from the axis.
+
+With `inc` and `pa` fixed to the disc values, a `spin = +1` model cannot fit a streamer that rotates against the disc, whatever the other parameters are. `spin` is a discrete choice with no gradient, so it **cannot be optimised**: put it in `fixed_params`. To decide the sense of rotation, run the fit with both values and compare the best-fit `chi2_total`, i.e. `min(result.loss_history)` (both fits have the same number of free parameters):
+
+```python
+for spin in (+1, -1):
+    result = gradient_descent.fit_streamline(
+        initial_opt_params,
+        {**fixed_params, 'spin': spin},
+        streamer,
+        distance,
+        param_bounds=param_bounds,
+        save_folder=f"sting_results/spin_{spin:+d}",
+    )
+    print(spin, min(result.loss_history))
+```
+
+If `spin` is not given it defaults to `+1`, and it is recorded in the saved `best_fit_params.json` either way.
 
 ### Streamer preprocessing
 

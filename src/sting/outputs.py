@@ -73,7 +73,8 @@ def evaluate_best_fit(
     data : tuple of arrays (ra_data, dec_data, v_data)
     distance_pc : float
     by_eye_params : dict or None
-        Optional by-eye parameters
+        Optional by-eye parameters. These are treated like optimised parameters, so they cannot
+        contain 'spin': the by-eye model uses the spin in fixed_params.
     Returns
     -------
     dict with keys:
@@ -524,7 +525,7 @@ def plot_morphology_by_epoch(
         return
     column_map = {c.split(' [')[0]: c for c in optimisation_log.columns}
     param_names = _opt_params_from_log(optimisation_log)
-    fixed_params_clean, initial_opt_params = gradient_descent.sanitize_param_partition(fixed_params, initial_opt_params, require_nonempty_opt=False)
+    initial_opt_params, fixed_params_clean = gradient_descent.sanitize_param_partition(initial_opt_params, fixed_params, require_nonempty_opt=False)
 
     epochs = optimisation_log['epoch'].values
 
@@ -774,7 +775,7 @@ def plot_ra_vel_by_epoch(
         return
     column_map = {c.split(' [')[0]: c for c in optimisation_log.columns}
     param_names = _opt_params_from_log(optimisation_log)
-    fixed_params_clean, initial_opt_params = gradient_descent.sanitize_param_partition(fixed_params, initial_opt_params, require_nonempty_opt=False)
+    initial_opt_params, fixed_params_clean = gradient_descent.sanitize_param_partition(initial_opt_params, fixed_params, require_nonempty_opt=False)
 
     epochs = optimisation_log['epoch'].values
 
@@ -925,7 +926,7 @@ def plot_dec_vel_by_epoch(
         return
     column_map = {c.split(' [')[0]: c for c in optimisation_log.columns}
     param_names = _opt_params_from_log(optimisation_log)
-    fixed_params_clean, initial_opt_params = gradient_descent.sanitize_param_partition(fixed_params, initial_opt_params, require_nonempty_opt=False)
+    initial_opt_params, fixed_params_clean = gradient_descent.sanitize_param_partition(initial_opt_params, fixed_params, require_nonempty_opt=False)
 
     epochs = optimisation_log['epoch'].values
 
@@ -1381,7 +1382,7 @@ def plot_vel_radius_by_epoch(
         return
     column_map = {c.split(' [')[0]: c for c in optimisation_log.columns}
     param_names = _opt_params_from_log(optimisation_log)
-    fixed_params_clean, initial_opt_params = gradient_descent.sanitize_param_partition(fixed_params, initial_opt_params, require_nonempty_opt=False)
+    initial_opt_params, fixed_params_clean = gradient_descent.sanitize_param_partition(initial_opt_params, fixed_params, require_nonempty_opt=False)
     
     epochs = optimisation_log['epoch'].values
 
