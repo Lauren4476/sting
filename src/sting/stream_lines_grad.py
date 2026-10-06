@@ -14,9 +14,6 @@ The assumed input units are:
 - distance to source: pc
 
 omega, rc and mu are magnitudes and must be positive.
-spin (+1 or -1) is the sense of rotation about the axis set by (inc, pa). +1 is the Mendoza
-convention (motion in the positive phi direction) and -1 is counter-rotating. Only phi and v_phi
-depend on it: the counter-rotating streamline is the mirror image phi -> -phi of the standard one.
 
 Last updated: 02-10-2026
 '''
@@ -205,7 +202,7 @@ def get_dphi(theta, theta0=jnp.radians(30)):
 
 
 @jax.jit
-def stream_line(r, r_mask, stream_state, theta0=jnp.radians(30), phi0=jnp.radians(15), spin=1.0):
+def stream_line(r, r_mask, stream_state, theta0=jnp.radians(30), phi0=jnp.radians(15)):
     '''
     It calculates the stream line following Mendoza et al. (2009),
     only for r < r0. Point r = r0 is handled outside the function.
@@ -217,7 +214,6 @@ def stream_line(r, r_mask, stream_state, theta0=jnp.radians(30), phi0=jnp.radian
     :param stream_state: StreamState named tuple containing precomputed quantities for the streamline
     :param theta0: radians
     :param phi0: radians
-    :param spin: +1 (co-rotating, Mendoza convention) or -1 (counter-rotating) about the rotation axis
     :return: theta, radians
     '''
     r = jnp.asarray(r, dtype=FLOAT_DTYPE)
@@ -232,8 +228,8 @@ def stream_line(r, r_mask, stream_state, theta0=jnp.radians(30), phi0=jnp.radian
 
     orb_ang = get_orb_ang(r_to_rc=r_to_rc, theta0=theta0, ecc=ecc)
     theta = get_theta(theta0, orb_ang, orb_ang0)
-    # get_dphi is always >= 0, so spin sets the direction of motion in phi
-    phi = phi0 + spin * get_dphi(theta, theta0=theta0)
+    # get_dphi is always >= 0
+    phi = phi0 + get_dphi(theta, theta0=theta0)
 
     # remove values where r_to_rc < 0.5 (inside centrifugal radius)
     # this will include all the mask points, and also any points that are inside 0.5*rc
@@ -257,7 +253,6 @@ def stream_line_vel(
     stream_state,
     theta0=jnp.radians(30),
     r_mask=None,
-    spin=1.0,
 ):
     '''
     It calculates the velocity along the stream line following Mendoza+(2009)
@@ -269,7 +264,6 @@ def stream_line_vel(
     :param stream_state: StreamState named tuple containing precomputed quantities for the streamline
     :param theta0: radians
     :param r_mask: boolean mask
-    :param spin: +1 (co-rotating, Mendoza convention) or -1 (counter-rotating). Sets the sign of v_phi
     :return: v_r, v_theta, v_phi in units of km/s
     '''
     rc = stream_state.rc
@@ -291,7 +285,7 @@ def stream_line_vel(
     # theta0 > pi/2, so v_theta takes the sign of cos(theta0) (the sqrt only gives its magnitude)
     v_theta_all = jnp.sign(jnp.cos(theta0)) * jnp.sin(theta0) / jnp.sin(theta) / r_to_rc \
                   * jnp.sqrt(sqrt_arg_safe)
-    v_phi_all = spin * jnp.power(jnp.sin(theta0), 2) / (jnp.sin(theta) * r_to_rc)
+    v_phi_all = jnp.power(jnp.sin(theta0), 2) / (jnp.sin(theta) * r_to_rc)
 
     return v_r_all * vk0, v_theta_all * vk0, v_phi_all * vk0
 
@@ -351,10 +345,6 @@ def check_rc_r0(rc, r0):
         "Centrifugal radius is larger than start of streamline. Model is not valid."
     )
 
-def check_spin(spin):
-    '''check that spin is exactly +1 or -1'''
-    checkify.check(jnp.abs(spin) == 1.0,
-                   "spin must be +1 (co-rotating) or -1 (counter-rotating).")
 
 def check_r_array(r, r_low):
     '''check that radius array extends down to r_low, otherwise the model doesn't extend far enough for the given npoints and deltar'''
@@ -369,13 +359,12 @@ def check_r_array(r, r_low):
     )
 
 @jax.jit
-def evaluate_streamline_at_radius(r, mass, r0, theta0, phi0, mu, v_r0, inc, pa, spin=1.0):
+def evaluate_streamline_at_radius(r, mass, r0, theta0, phi0, mu, v_r0, inc, pa):
     '''Evaluate the analytic Mendoza streamline at arbitrary radius or radius array.
 
     This is the continuous analogue of the sampled xyz_stream() model: it computes
     spherical geometry, cartesian coordinates, and rotated sky-plane projections
     for a scalar or array of radii without constructing a sampling grid.
-    spin is +1 (co-rotating, Mendoza convention) or -1 (counter-rotating) about the rotation axis.
     '''
     r = jnp.asarray(r, dtype=FLOAT_DTYPE)
     mass = jnp.asarray(mass, dtype=FLOAT_DTYPE)
@@ -386,7 +375,6 @@ def evaluate_streamline_at_radius(r, mass, r0, theta0, phi0, mu, v_r0, inc, pa, 
     v_r0 = jnp.asarray(v_r0, dtype=FLOAT_DTYPE)
     inc = jnp.asarray(inc, dtype=FLOAT_DTYPE)
     pa = jnp.asarray(pa, dtype=FLOAT_DTYPE)
-    spin = jnp.asarray(spin, dtype=FLOAT_DTYPE)
 
     stream_state = build_stream_quantities(mass=mass, r0=r0, theta0=theta0, mu=mu, v_r0=v_r0)
     rc = stream_state.rc
@@ -400,8 +388,7 @@ def evaluate_streamline_at_radius(r, mass, r0, theta0, phi0, mu, v_r0, inc, pa, 
     orb_ang0 = stream_state.orb_ang0
     orb_ang = get_orb_ang(r_to_rc=r_for_eval / rc, theta0=theta0, ecc=ecc)
     theta = get_theta(theta0, orb_ang, orb_ang0)
-    # get_dphi is always >= 0, so spin sets the direction of motion in phi
-    phi = phi0 + spin * get_dphi(theta, theta0=theta0)
+    phi = phi0 + get_dphi(theta, theta0=theta0)
 
     theta = jnp.where(r_valid, theta, theta0 + to_float64(0.1))
     phi = jnp.where(r_valid, phi, phi0)
@@ -414,7 +401,6 @@ def evaluate_streamline_at_radius(r, mass, r0, theta0, phi0, mu, v_r0, inc, pa, 
         stream_state=stream_state,
         theta0=theta0,
         r_mask=None,
-        spin=spin,
     )
 
     v_x = v_r * jnp.sin(theta) * jnp.cos(phi) + v_theta * jnp.cos(theta) * jnp.cos(phi) - v_phi * jnp.sin(phi)
@@ -430,7 +416,7 @@ def evaluate_streamline_at_radius(r, mass, r0, theta0, phi0, mu, v_r0, inc, pa, 
     return (rotated_x, rotated_y, rotated_z), (rotated_v_x, rotated_v_y, rotated_v_z), r_valid
 
 @jax.jit
-def evaluate_streamline_at_delta(delta, mass, r0, theta0, phi0, mu, v_r0, inc, pa, spin=1.0):
+def evaluate_streamline_at_delta(delta, mass, r0, theta0, phi0, mu, v_r0, inc, pa):
     '''Evaluate the Mendoza streamline in closed form at in-plane angle delta.
 
     delta is the angle travelled within the orbital plane since r0, i.e. delta = orb_ang - orb_ang0
@@ -446,15 +432,10 @@ def evaluate_streamline_at_delta(delta, mass, r0, theta0, phi0, mu, v_r0, inc, p
         position = r n,  velocity = (vk0 / s) (-e sin(orb_ang) n + (1 - e cos(orb_ang)) t)
     where n and t are the radial and tangential unit vectors in the orbital plane.
 
-    spin = -1 (counter-rotating) mirrors the in-plane unit vectors in y before the rotation by phi0.
-    Since reflect_y . Rz(-phi0) = Rz(phi0) . reflect_y, this is the mirror image of the spin = +1
-    streamline started at -phi0, which is what phi = phi0 + spin*dphi and spin*v_phi give in
-    evaluate_streamline_at_radius and xyz_stream.
 
     :return: (x, y, z) in au, (v_x, v_y, v_z) in km/s, both rotated onto the sky, and r in au
     '''
     delta = jnp.asarray(delta, dtype=FLOAT_DTYPE)
-    spin = jnp.asarray(spin, dtype=FLOAT_DTYPE)
     stream_state = build_stream_quantities(mass=mass, r0=r0, theta0=theta0, mu=mu, v_r0=v_r0)
     rc = stream_state.rc
     nu = stream_state.nu
@@ -476,12 +457,11 @@ def evaluate_streamline_at_delta(delta, mass, r0, theta0, phi0, mu, v_r0, inc, p
 
     # radial (n) and tangential (t) unit vectors in the orbital plane, before rotating by phi0.
     # The orbital plane contains the start point (theta0, phi0) and the initial azimuthal direction.
-    # spin mirrors them in y, so the streamline moves in the -phi direction for spin = -1
     n_x = sin_theta0 * cos_delta
-    n_y = spin * sin_delta
+    n_y = sin_delta
     n_z = cos_theta0 * cos_delta
     t_x = -sin_theta0 * sin_delta
-    t_y = spin * cos_delta
+    t_y = cos_delta
     t_z = -cos_theta0 * sin_delta
 
     # rotate about the z-axis by phi0
@@ -534,7 +514,6 @@ def forward_model_at_delta(delta, model_params, distance_pc):
         v_r0=model_params['v_r0'],
         inc=model_params['inc'],
         pa=model_params['pa'],
-        spin=model_params.get('spin', 1.0),
     )
     ra_model = -x / distance_pc
     dec_model = z / distance_pc
@@ -569,7 +548,6 @@ def forward_model_at_radius(r, model_params, distance_pc):
         v_r0=model_params['v_r0'],
         inc=model_params['inc'],
         pa=model_params['pa'],
-        spin=model_params.get('spin', 1.0),
     )
 
     ra_model = -x / distance_pc
@@ -579,7 +557,7 @@ def forward_model_at_radius(r, model_params, distance_pc):
 
 def xyz_stream(mass=0.5, r0=1e4, theta0=jnp.radians(30),
                phi0=jnp.radians(15), mu=0.1, v_r0=0,
-               inc=0, pa=0, rmin=None, deltar=1, npoints=1e6, spin=1.0):
+               inc=0, pa=0, rmin=None, deltar=1, npoints=1e6):
     '''
     it gets xyz coordinates and velocities for a stream line.
     They are also rotated in PA and inclination along the line of sight.
@@ -604,8 +582,6 @@ def xyz_stream(mass=0.5, r0=1e4, theta0=jnp.radians(30),
         This is just so that arrays are fixed length for jax/jit compatibility,
         but the actual number of valid points is determined by r0, rmin, rc, deltar,
         so some of the returned points may be NaN if npoints is larger than the number of valid points
-    :param spin: sense of rotation about the axis set by (inc, pa): +1 is co-rotating (Mendoza convention,
-        motion in the positive phi direction), -1 is counter-rotating. Must be exactly +1 or -1
     :return: x, y, z in (au), v_x, v_y, v_z in (km/s)
     '''
 
@@ -618,7 +594,6 @@ def xyz_stream(mass=0.5, r0=1e4, theta0=jnp.radians(30),
     inc = jnp.asarray(inc, dtype=FLOAT_DTYPE)
     pa = jnp.asarray(pa, dtype=FLOAT_DTYPE)
     deltar = jnp.asarray(deltar, dtype=FLOAT_DTYPE)
-    spin = jnp.asarray(spin, dtype=FLOAT_DTYPE)
     stream_state = build_stream_quantities(mass=mass, r0=r0, theta0=theta0, mu=mu, v_r0=v_r0)
     rc = stream_state.rc
     mu = stream_state.mu
@@ -627,7 +602,6 @@ def xyz_stream(mass=0.5, r0=1e4, theta0=jnp.radians(30),
     rotation_matrix = build_rotation_matrix(inc, pa)
 
     check_rc_r0(rc, r0)
-    check_spin(spin)
 
     # find the smallest radius for calculation
     # this is the maximum between rmin and 0.5*rc
@@ -641,8 +615,8 @@ def xyz_stream(mass=0.5, r0=1e4, theta0=jnp.radians(30),
     
     # calculate positions and velocities inside r0
     # the valid_mask will later be used to mask out invalid points. currently these values are zero
-    orb_ang, theta, phi, valid_mask = stream_line(r, r_mask, stream_state=stream_state, theta0=theta0, phi0=phi0, spin=spin)
-    v_r, v_theta, v_phi = stream_line_vel(r, theta, orb_ang, stream_state=stream_state, theta0=theta0, r_mask=r_mask, spin=spin)
+    orb_ang, theta, phi, valid_mask = stream_line(r, r_mask, stream_state=stream_state, theta0=theta0, phi0=phi0)
+    v_r, v_theta, v_phi = stream_line_vel(r, theta, orb_ang, stream_state=stream_state, theta0=theta0, r_mask=r_mask)
     # prepend initial positions and velocities at r0
     valid_mask_full = jnp.concatenate((jnp.asarray([True], dtype=bool), valid_mask))
     r_full = jnp.concatenate((jnp.asarray([r0], dtype=FLOAT_DTYPE), r))
@@ -651,7 +625,7 @@ def xyz_stream(mass=0.5, r0=1e4, theta0=jnp.radians(30),
     orb_ang0 = stream_state.orb_ang0
     orb_ang_full = jnp.concatenate((jnp.asarray([orb_ang0], dtype=FLOAT_DTYPE), orb_ang))
     v_r0_consistent, v_theta0_consistent, v_phi0_consistent = stream_line_vel(
-        r0, theta0, orb_ang0, stream_state=stream_state, theta0=theta0, r_mask=None, spin=spin
+        r0, theta0, orb_ang0, stream_state=stream_state, theta0=theta0, r_mask=None
     )
     v_r_full = jnp.concatenate((jnp.asarray([v_r0_consistent], dtype=FLOAT_DTYPE), v_r))
     v_theta_full = jnp.concatenate((jnp.asarray([v_theta0_consistent], dtype=FLOAT_DTYPE), v_theta))

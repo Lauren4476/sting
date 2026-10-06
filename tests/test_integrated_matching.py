@@ -56,10 +56,9 @@ def _synthetic_streamer(n=10, sigma_pos=0.3, sigma_v=0.2):
 # closed-form model
 # ---------------------------------------------------------------------------
 
-@pytest.mark.parametrize('spin', [1.0, -1.0])
 @pytest.mark.parametrize('theta0', [0.3, 0.7, 1.3, 1.9, 2.6])
-def test_closed_form_matches_radius_model(theta0, spin):
-    params = _spherical_params(theta0=theta0, spin=spin)
+def test_closed_form_matches_radius_model(theta0):
+    params = _spherical_params(theta0=theta0)
     delta = jnp.linspace(0.0, jnp.pi / 2, 200)
     pos, vel, r = stream_lines_grad.evaluate_streamline_at_delta(delta, **params)
     state = stream_lines_grad.build_stream_quantities(
@@ -75,11 +74,10 @@ def test_closed_form_matches_radius_model(theta0, spin):
         np.testing.assert_allclose(np.asarray(a)[keep], np.asarray(b)[keep], atol=1e-4)
 
 
-@pytest.mark.parametrize('spin', [1.0, -1.0])
 @pytest.mark.parametrize('theta0', [0.7, 2.1])
-def test_closed_form_velocity_is_time_derivative_of_position(theta0, spin):
+def test_closed_form_velocity_is_time_derivative_of_position(theta0):
     # dx/dt = dx/ddelta * ddelta/dt, with ddelta/dt = h / r^2 and h = vk0 rc sin(theta0)
-    params = _spherical_params(theta0=theta0, spin=spin)
+    params = _spherical_params(theta0=theta0)
     state = stream_lines_grad.build_stream_quantities(
         params['mass'], params['r0'], params['theta0'], params['mu'], params['v_r0']
     )
@@ -354,114 +352,4 @@ def test_fit_streamline_integrated_runs_and_estimates_errors():
     assert all(np.isfinite(value) for value in result.param_errors.values())
 
 
-# ---------------------------------------------------------------------------
-# counter-rotating streamers (spin = -1)
-# ---------------------------------------------------------------------------
 
-COUNTER_PARAMS = dict(MODEL_PARAMS, spin=-1.0)
-
-
-def _counter_rotating_streamer(n=10, sigma_pos=0.3, sigma_v=0.2, noise=0.0, seed=0):
-    """Data on the spin = -1 streamline, starting at r0 so the outer anchor is at the truth"""
-    delta = jnp.linspace(0.0, 1.4, n)
-    ra, dec, v, _ = stream_lines_grad.forward_model_at_delta(delta, COUNTER_PARAMS, DISTANCE)
-    if noise:
-        rng = np.random.default_rng(seed)
-        ra = ra + noise * sigma_pos * rng.standard_normal(n)
-        dec = dec + noise * sigma_pos * rng.standard_normal(n)
-        v = v + noise * sigma_v * rng.standard_normal(n)
-    ra_sigma = jnp.full(n, sigma_pos)
-    dec_sigma = jnp.full(n, sigma_pos)
-    v_sigma = jnp.full(n, sigma_v)
-    return types.SimpleNamespace(
-        pc_coords=jnp.stack((ra, dec, v, jnp.ones(n))),
-        ra_data=ra, dec_data=dec, v_data=v,
-        ra_sigma=ra_sigma, dec_sigma=dec_sigma, v_sigma=v_sigma,
-        data=(ra, dec, v),
-        uncertainties=(ra_sigma, dec_sigma, v_sigma),
-    )
-
-
-def _prepare(streamer, method, n):
-    if method == 'legacy':
-        return extract_streamline.prepare_data(streamer.data, streamer.uncertainties, n_elements=n)
-    return gradient_descent.prepare_matching_data(streamer, method, n_elements=n)
-
-
-def _streamer_from_data(ra, dec, v, sigma_pos=0.3, sigma_v=0.2):
-    n = ra.size
-    ra_sigma, dec_sigma, v_sigma = jnp.full(n, sigma_pos), jnp.full(n, sigma_pos), jnp.full(n, sigma_v)
-    return types.SimpleNamespace(
-        pc_coords=jnp.stack((ra, dec, v, jnp.ones(n))), ra_data=ra, dec_data=dec, v_data=v,
-        ra_sigma=ra_sigma, dec_sigma=dec_sigma, v_sigma=v_sigma,
-        data=(ra, dec, v), uncertainties=(ra_sigma, dec_sigma, v_sigma),
-    )
-
-
-@pytest.mark.parametrize('loss_method', [0, 1])
-@pytest.mark.parametrize('method', gradient_descent.MATCHING_METHOD_CHOICES)
-def test_spin_reaches_every_loss_path(method, loss_method):
-    # This fails if any model call in a loss path does not get spin from model_params.
-    # With inc = pa = 0 and v_lsr = 0, the spin = -1 streamline from phi0 is the spin = +1 streamline from -phi0
-    # with the line-of-sight velocity negated, so both fits to correspondingly mirrored data have the same chi2.
-    # (The chi2 at the truth is not ~0, since the matching methods are not exact even for noiseless data.)
-    params = dict(MODEL_PARAMS, inc=0.0, pa=0.0, v_lsr=0.0)
-    n = 20
-    delta = jnp.linspace(0.0, 1.4, n)
-    ra, dec, v, _ = stream_lines_grad.forward_model_at_delta(delta, dict(params, spin=-1.0), DISTANCE)
-    prepared_counter = _prepare(_streamer_from_data(ra, dec, v), method, n)
-    prepared_mirror = _prepare(_streamer_from_data(ra, dec, -v), method, n)
-
-    def loss(model_params, prepared):
-        return float(gradient_descent.chi2_loss(
-            model_params, DISTANCE, prepared, loss_method=loss_method,
-            matching_method=method, npoints=20000, integration_nodes=512,
-        )[0])
-
-    counter = loss(dict(params, spin=-1.0), prepared_counter)
-    mirror = loss(dict(params, phi0=-params['phi0'], spin=1.0), prepared_mirror)
-    wrong = loss(dict(params, spin=1.0), prepared_counter)
-    assert counter == pytest.approx(mirror, rel=1e-6, abs=1e-8)
-    assert wrong > 10 * counter
-
-
-@pytest.mark.parametrize('method', ['continuous', 'integrated'])
-def test_fit_recovers_counter_rotating_streamer(method):
-    streamer = _counter_rotating_streamer(n=12, sigma_pos=0.1, sigma_v=0.1, noise=0.5)
-    truth = {'phi0': COUNTER_PARAMS['phi0'], 'theta0': COUNTER_PARAMS['theta0'], 'v_r0': COUNTER_PARAMS['v_r0']}
-    start = {'phi0': 3.42, 'theta0': 0.74, 'v_r0': 0.55}
-    fixed = {key: value for key, value in MODEL_PARAMS.items() if key not in start}
-
-    def fit(spin):
-        return gradient_descent.fit_streamline(
-            start, dict(fixed, spin=spin), streamer, DISTANCE,
-            learning_rate=0.002, n_epochs=150, info_every=1000, early_stopping_patience=1000,
-            save_folder=None, loss_method=0, matching_method=method,
-        )
-
-    counter = fit(-1.0)
-    co = fit(1.0)
-    assert counter.loss_history[-1] < 0.1 * min(co.loss_history)
-    assert counter.param_errors is not None
-    for key, value in truth.items():
-        error = counter.param_errors[key]
-        assert np.isfinite(error) and error > 0.0
-        assert abs(float(counter.best_opt_params[key]) - value) < max(5 * error, 0.02)
-
-
-@pytest.mark.parametrize('opt_extra, fixed_extra, priors, match', [
-    ({'spin': -1.0}, {}, None, 'cannot be optimised'),
-    ({}, {'spin': -1.0}, {'spin': (-1.0, 0.1)}, 'fixed and cannot have a prior'),
-    ({}, {'spin': 0.5}, None, 'spin must be'),
-    ({}, {'mu': -0.2}, None, 'spin = -1'),
-])
-def test_fit_streamline_validates_spin(opt_extra, fixed_extra, priors, match):
-    streamer = _counter_rotating_streamer()
-    opt_params = dict({'phi0': 3.4}, **opt_extra)
-    fixed_params = {key: value for key, value in MODEL_PARAMS.items() if key not in opt_params}
-    fixed_params.update(fixed_extra)
-    with pytest.raises(ValueError, match=match):
-        gradient_descent.fit_streamline(
-            opt_params, fixed_params, streamer, DISTANCE, n_epochs=1, save_folder=None,
-            matching_method='integrated', priors=priors,
-        )

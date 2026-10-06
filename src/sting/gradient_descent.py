@@ -125,7 +125,6 @@ STREAMLINE_MODEL_PARAM_KEYS = (
     'rmin',
     'deltar',
     'v_lsr',
-    'spin',
 )
 
 #### Return types
@@ -318,9 +317,7 @@ def check_param_types(opt_params, fixed_params):
 def sanitize_param_partition(initial_opt_params, fixed_params, require_nonempty_opt=False):
     """Sanitize and validate opt/fixed parameter partition for streamline modeling.
     Note: exactly one of 'rc' or 'omega' must be present across initial_opt_params and fixed_params, to determine mu=rc/r0.
-    The rotation parameter ('rc', 'omega' or 'mu') is a magnitude and must be positive.
-    'spin' (+1 co-rotating, -1 counter-rotating) is optional and can only be fixed. If it is missing,
-    fixed_params['spin'] = +1 is added."""
+    The rotation parameter ('rc', 'omega' or 'mu') is a magnitude and must be positive."""
     opt_params = clean_model_param_dict(initial_opt_params, 'initial_opt_params')
     fixed_params = clean_model_param_dict(fixed_params, 'fixed_params')
 
@@ -340,16 +337,16 @@ def sanitize_param_partition(initial_opt_params, fixed_params, require_nonempty_
         )
     
     # spin is a discrete choice (no gradient), so it can't be optimised. It defaults to +1 (co-rotating)
-    if 'spin' in opt_params:
-        raise ValueError(
-            "spin is a discrete choice (+1 or -1) and cannot be optimised. Put it in fixed_params, "
-            "and run both senses to compare chi2."
-        )
-    if 'spin' not in fixed_params:
-        fixed_params['spin'] = to_float64(1.0)
-    spin = fixed_params['spin']
-    if spin is None or not is_numeric_value(spin) or jnp.ndim(spin) != 0 or float(spin) not in (1.0, -1.0):
-        raise ValueError(f"spin must be +1 (co-rotating) or -1 (counter-rotating). Got {spin!r}.")
+    # if 'spin' in opt_params:
+    #     raise ValueError(
+    #         "spin is a discrete choice (+1 or -1) and cannot be optimised. Put it in fixed_params, "
+    #         "and run both senses to compare chi2."
+    #     )
+    # if 'spin' not in fixed_params:
+    #     fixed_params['spin'] = to_float64(1.0)
+    # spin = fixed_params['spin']
+    # if spin is None or not is_numeric_value(spin) or jnp.ndim(spin) != 0 or float(spin) not in (1.0, -1.0):
+    #     raise ValueError(f"spin must be +1 (co-rotating) or -1 (counter-rotating). Got {spin!r}.")
 
     # the rotation parameter is a magnitude. The sense of rotation is set by spin
     rotation_key = rotation_keys_present[0]
@@ -363,11 +360,11 @@ def sanitize_param_partition(initial_opt_params, fixed_params, require_nonempty_
             description = "mu = rc/r0 is a ratio of radii"
         raise ValueError(
             f"{description} and must be positive. Got {rotation_key} = {rotation_value!r}. "
-            "To model counter-rotation, set spin = -1 in fixed_params."
         )
 
     # check all other required parameters are present (except mu, rc, omega and spin which we already dealt with)
-    already_dealt_with = {'rc', 'omega', 'mu', 'spin'}
+    # already_dealt_with = {'rc', 'omega', 'mu', 'spin'}
+    already_dealt_with = {'rc', 'omega', 'mu'}
     missing = []
     for key in STREAMLINE_MODEL_PARAM_KEYS:
         if key not in all_params and key not in already_dealt_with:
@@ -614,8 +611,8 @@ def format_param(key, value):
         return f"{val:.6g}"
     if key == 'omega':
         return f"{val:.6g} 1/s"
-    if key == 'spin':
-        return f"{val:+.0f}"
+    # if key == 'spin':
+    #     return f"{val:+.0f}"
     unit = DISPLAY_UNITS.get(key, '')
     if unit:
         suffix = f" {unit}"
@@ -890,7 +887,7 @@ def forward_model(model_params, distance_pc, npoints=1e6):
         rmin=rmin,
         deltar=model_params['deltar'],
         npoints=npoints,
-        spin=model_params.get('spin', 1.0),
+        # spin=model_params.get('spin', 1.0),
     )
     # err.throw()
 

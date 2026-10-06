@@ -73,8 +73,7 @@ def evaluate_best_fit(
     data : tuple of arrays (ra_data, dec_data, v_data)
     distance_pc : float
     by_eye_params : dict or None
-        Optional by-eye parameters. These are treated like optimised parameters, so they cannot
-        contain 'spin': the by-eye model uses the spin in fixed_params.
+        Optional by-eye parameters. 
     Returns
     -------
     dict with keys:

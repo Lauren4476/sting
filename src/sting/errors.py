@@ -55,7 +55,6 @@ STREAMLINE_MODEL_PARAM_KEYS = (
     'rmin',
     'deltar',
     'v_lsr',
-    'spin',
 )
 
 
@@ -152,7 +151,6 @@ def chi2_loss_hsafe(model_params, distance_pc, prepared_data, loss_method, model
         rmin=rmin,
         deltar=model_params['deltar'],
         npoints=npoints,
-        spin=model_params.get('spin', 1.0),
     )
 
     ra_model = -x / distance_pc
@@ -237,8 +235,8 @@ def compute_model_sort_idx(best_opt_params, fixed_params, distance_pc, prepared_
         pa=float(model_params['pa']),
         rmin=float(rmin),
         deltar=float(model_params['deltar']),
+        # spin=float(model_params.get('spin', 1.0)),
         npoints=npoints,
-        spin=float(model_params.get('spin', 1.0)),
     )
 
     ra_model = jnp.asarray(-x, dtype=jnp.float64) / float(distance_pc)
